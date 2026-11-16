@@ -1,0 +1,60 @@
+{
+  "name": "weread-dsh",
+  "version": "1.9.10",
+  "private": true,
+  "type": "module",
+  "license": "GPL-3.0",
+  "description": "微信读书：笔记同步、Markdown 导出、笔记搜索、阅读洞察与笔记漫游（由 weread-vscode 0.1.2 VSIX 改造）",
+  "scripts": {
+    "build": "node build.mjs",
+    "check": "node build.mjs --check",
+    "mcp": "node tools/mcp-server.mjs",
+    "test": "node build.mjs --check && node --test \"test/*.test.js\" && node smoke.mjs && node rmsmoke.mjs && node tools/react-mount-test.mjs && node tools/mcp-server.mjs --selftest"
+  },
+  "devDependencies": {
+    "react": "^18.3.1",
+    "react-test-renderer": "^18.3.1"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "build.mjs",
+    "cordis.patch.yml",
+    "icon.svg",
+    "locale/*.json",
+    "lib/*.js",
+    "lib/*.mjs",
+    "lib/vendor/qrcode/**/*.cjs",
+    "lib/vendor/qrcode/LICENSE-*",
+    "parts/*.js",
+    "test/*.js",
+    "smoke.mjs",
+    "rmsmoke.mjs",
+    "tools/*.mjs",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-input-trigger",
+        "@deepseek-ai/dsh-client-ui-workspace",
+        "@deepseek-ai/dsh-client-ui-sidebar",
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    }
+  }
+}

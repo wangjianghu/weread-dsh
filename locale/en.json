@@ -1,0 +1,9 @@
+{
+  "meta": {
+    "title": "WeRead",
+    "description": "Sync WeRead notes to local Markdown, search, reading insights, note roaming and spaced repetition review."
+  },
+  "panel": {
+    "title": "WeRead"
+  }
+}

@@ -1,0 +1,13 @@
+- insert:
+    - id: weread
+      name: '@local/dsh-weread'
+      config:
+        outputPath: ''
+        fileNameTemplate: '{{title}}'
+        noteTemplate: ''
+        autoSync: true
+        syncInterval: '24h'
+        categoryMode: 'level1'
+        showCover: true
+        multiAccountEnabled: true
+        language: 'zh-CN'
