@@ -13,15 +13,17 @@ smokeKiller.unref?.();
 const registrations = { web: [], tools: [], systemPrompt: [], upgrade: [] };
 // v1.9.11：全场景固定自签 token（经 rawConfig.apiToken 注入；生产无此配置时插件随机生成）
 const SMOKE_TOKEN = 'smoke-fixed-token-0123456789abcdef0123456789abcdef';
+// v1.9.13：admit 按宿主真实语义返回 { rejection: 401 }（拒绝是返回值不是异常——
+// dshopen #522 复审要求「仅在明确准入时继续」），冒烟全链必须持 Bearer token。
+const admitDeny = async () => ({ rejection: 401 });
 const ctx = {
   effect: (fn) => { fn(); return () => {}; },
   webServer: { register: (r) => registrations.web.push(r), registerUpgrade: (r) => { registrations.upgrade.push(r); return () => {}; } },
   tools: { register: (t) => registrations.tools.push(t) },
   systemPrompt: { context: (d) => { registrations.systemPrompt.push(d); return () => {}; } },
-  // v1.9.11：模拟「宿主在场但请求未携带认证 cookie」——admit 恒拒，冒烟全链必须持 Bearer token
   // v1.9.12：admit 经 ctx.inject(['connection']) 动态注入捕获（mock 立即激活，语义等价）
-  inject: (deps, cb) => cb({ connection: { admit: async () => { throw new Error('no browser session'); } } }),
-  connection: { admit: async () => { throw new Error('no browser session'); } },
+  inject: (deps, cb) => cb({ connection: { admit: admitDeny } }),
+  connection: { admit: admitDeny },
 };
 const dispose = apply(ctx, { stateDir: path.join(tmp, 'state'), outputPath: '', apiToken: SMOKE_TOKEN });
 

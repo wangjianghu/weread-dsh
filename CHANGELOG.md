@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.9.13（2026-11-19）
+
+**安全修复（dshopen #522 复审）：admit 拒绝语义修正——仅在明确准入时继续。**
+
+- **问题**：v1.9.12 的 `callerAuthenticated` 以 `try { await admit(req); return true } catch` 判定，而 DSH `connection.admit` 拒绝时**不抛异常**，返回 `{ rejection: 401|403 }`；成功才返回 `{ peer }`。旧写法会把拒绝结果当成功放行（未认证请求被误准入）。smoke 的 mock 以抛异常模拟拒绝，语义失真，未测出。
+- **修复**：仅在 `admission` 为对象、无 `rejection` 成员且带 `peer` 时通过；`undefined/null/空对象/假值` 一律拒绝（fail-closed）；异常兜底保留，`await` 兼容未来异步化。HTTP 路由与 `/weread/ws` 握手共用此判定。
+- **包元数据**：`package.json` 补 `repository` 字段（dshopen #522 复审要求，指向 GitHub 仓库）。
+- **测试**：smoke mock 改为真实返回值语义（`{rejection:401}`）；新增 5 例 admit 语义回归（401/403 拒绝、peer 通过、假值拒绝、异常拒绝）；全量 168 单测 + 428 smoke 断言 + MCP selftest 绿。
+
 ## 1.9.12（2026-11-19）
 
 **Bug 修复：面板「加载失败：cannot get property "connection" without inject」（v1.9.11 引入的回归）。**

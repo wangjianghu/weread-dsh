@@ -51,7 +51,15 @@ export function createCallerAuthenticated({ bearerOk, getAdmit }) {
     if (authHeader.startsWith('Bearer ') && bearerOk(authHeader.slice(7))) return true;
     const admit = getAdmit();
     if (typeof admit !== 'function') return false;
-    try { await admit(req); return true; } catch { return false; }
+    // dshopen #522 复审：DSH connection.admit 拒绝时不抛异常而是返回 { rejection: 401|403 }，
+    // 明确准入才返回 { peer }。必须「仅在明确准入时继续」——把 rejection 结果当成功会放行
+    // 未认证请求；throw 只是兜底（await 兼容未来异步化）。
+    try {
+      const admission = await admit(req);
+      if (!admission || typeof admission !== 'object') return false;
+      if ('rejection' in admission) return false;
+      return admission.peer !== undefined;
+    } catch { return false; }
   };
 }
 

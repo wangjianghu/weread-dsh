@@ -1050,7 +1050,7 @@ window.__ModuleLoader__.load({
 `;
 
 /* 由 build.mjs 注入（源：package.json version）——勿手改此行 */
-W.VERSION = "1.9.12";
+W.VERSION = "1.9.13";
 /**
  * 微信读书 DSH 插件 — 10-bookshelf
  * 书架 tab（未登录横幅 / 工具栏 / 分类分组列表）+ 登录弹层 W.LoginModal。

@@ -25,9 +25,9 @@ describe('createCallerAuthenticated（v1.9.12）', () => {
     assert.equal(await auth(req({})), false);
   });
 
-  test('Bearer 缺失 + admit 判定通过（宿主浏览器 cookie 通道）→ true', async () => {
+  test('Bearer 缺失 + admit 明确准入（宿主浏览器 cookie 通道）→ true', async () => {
     let seen = null;
-    const admit = async (r) => { seen = r; };
+    const admit = async (r) => { seen = r; return { peer: { id: 'browser' } }; };
     const auth = createCallerAuthenticated({ bearerOk, getAdmit: () => admit });
     assert.equal(await auth(req({ host: '127.0.0.1:1' })), true);
     assert.equal(seen?.headers?.host, '127.0.0.1:1', 'admit 收到原请求');
@@ -47,12 +47,44 @@ describe('createCallerAuthenticated（v1.9.12）', () => {
   });
 
   test('getAdmit 每次请求重新求值（注入/卸载即时生效）', async () => {
-    const admits = [null, async () => {}, null];
+    const admits = [null, async () => ({ peer: {} }), null];
     let i = 0;
     const auth = createCallerAuthenticated({ bearerOk, getAdmit: () => admits[Math.min(i++, admits.length - 1)] });
     assert.equal(await auth(req({})), false);
     assert.equal(await auth(req({})), true);
     assert.equal(await auth(req({})), false);
+  });
+
+  // v1.9.13：dshopen #522 复审——DSH connection.admit 的真实语义是
+  // 拒绝返回 { rejection: 401|403 }（不抛异常）、准入返回 { peer }。
+  describe('admit 真实返回值语义（v1.9.13）', () => {
+    test('admit 返回 {rejection:401} → 拒绝（核心回归：不得当成功放行）', async () => {
+      const auth = createCallerAuthenticated({ bearerOk, getAdmit: () => async () => ({ rejection: 401 }) });
+      assert.equal(await auth(req({})), false);
+    });
+
+    test('admit 返回 {rejection:403} → 拒绝', async () => {
+      const auth = createCallerAuthenticated({ bearerOk, getAdmit: () => async () => ({ rejection: 403 }) });
+      assert.equal(await auth(req({})), false);
+    });
+
+    test('admit 返回 {peer}（明确准入）→ 通过', async () => {
+      const peer = { id: 'p1' };
+      const auth = createCallerAuthenticated({ bearerOk, getAdmit: () => async () => ({ peer }) });
+      assert.equal(await auth(req({})), true);
+    });
+
+    test('admit 返回无 peer 的空对象/undefined/假值 → 拒绝（fail-closed）', async () => {
+      for (const ret of [{}, undefined, null, 'ok', 0]) {
+        const auth = createCallerAuthenticated({ bearerOk, getAdmit: () => async () => ret });
+        assert.equal(await auth(req({})), false, `admit 返回 ${JSON.stringify(ret)} 应拒绝`);
+      }
+    });
+
+    test('admit 仍以异常表达失败 → 拒绝（兜底保留）', async () => {
+      const auth = createCallerAuthenticated({ bearerOk, getAdmit: () => async () => { throw new Error('x'); } });
+      assert.equal(await auth(req({})), false);
+    });
   });
 });
 
