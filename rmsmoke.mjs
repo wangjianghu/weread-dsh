@@ -295,8 +295,7 @@ try {
     // v1.9.9：失败横幅仅限「已登录且非登录类失败」；过期不自动弹登录窗（仅首用无书引导）
     [clientSrc.includes('!!state?.loggedIn') && clientSrc.includes('state?.syncState?.loginExpired') && clientSrc.includes("String(state.syncState.error).includes('登录已过期')"), '失败横幅仅限已登录且非登录类失败（未登录/过期走黄色提示条）'],
     [clientSrc.includes('!st.loginExpired && st.booksCount === 0'), '登录过期不再自动弹登录窗（仅首用无书保留引导）'],
-  ];
-  for (const [cond, msg] of checks) {
+  ];  for (const [cond, msg] of checks) {
     if (cond) console.log(`  ✓ ${msg}`);
     else { console.error(`  ✗ 缺失：${msg}`); process.exitCode = 1; }
   }

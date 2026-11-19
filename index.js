@@ -38,6 +38,23 @@ export function safeTokenEqual(presented, expected) {
   return timingSafeEqual(a, b);
 }
 
+/**
+ * v1.9.12 宿主调用方认证判定（导出供单测）：Bearer（MCP/本地工具）或 admit（宿主签名
+ * cookie，经 ctx.inject(['connection']) 动态注入捕获，绝不直接读 ctx.connection——Cordis
+ * 代理对未声明 inject 的服务属性访问直接抛错，?. 无法绕过）其一通过。
+ * @param {{ bearerOk: (t: string) => boolean, getAdmit: () => null | ((req: any) => Promise<void>) }} deps
+ * @returns {(req: any) => Promise<boolean>}
+ */
+export function createCallerAuthenticated({ bearerOk, getAdmit }) {
+  return async (req) => {
+    const authHeader = String(req.headers?.authorization || '');
+    if (authHeader.startsWith('Bearer ') && bearerOk(authHeader.slice(7))) return true;
+    const admit = getAdmit();
+    if (typeof admit !== 'function') return false;
+    try { await admit(req); return true; } catch { return false; }
+  };
+}
+
 
 const DEFAULT_THEMES = [
   { id: 'white', name: '纯白', bg: '#FFFFFF', primary: '#312927', weekday: '#5A514D', divider: '#D5CEC4', watermark: '#757575' },
@@ -1089,6 +1106,15 @@ export function apply(ctx, rawConfig = {}) {
     ? rawConfig.apiToken.trim()
     : randomBytes(32).toString('hex');
   const bearerOk = (presented) => safeTokenEqual(presented, localApiToken);
+  // v1.9.12 修复：ctx.connection 是 Cordis 服务属性，未声明 inject 直接访问会抛
+  // `cannot get property "connection" without inject`（?. 可选链无法绕过代理 get 拦截）。
+  // 用动态注入 ctx.inject 捕获 admit：desktop 有 connection 服务则激活；headless 没有
+  // 则 admitFn 保持 null，插件照常工作、认证降级为仅 Bearer（fail-closed 503）。
+  let admitFn = null;
+  ctx.inject(['connection'], (ctx2) => {
+    admitFn = typeof ctx2.connection?.admit === 'function' ? ctx2.connection.admit.bind(ctx2.connection) : null;
+    return () => { admitFn = null; };
+  });
   const writeEndpoint = (baseUrl) => {
     try {
       fs.writeFileSync(path.join(stateDir, 'endpoint.json'), JSON.stringify({ baseUrl, token: localApiToken, savedAt: Date.now() }, null, 2));
@@ -1096,13 +1122,7 @@ export function apply(ctx, rawConfig = {}) {
   };
   // 激活即写一份（getOrigin 可用时）；首个请求再按 Host 头刷新（覆盖无 getOrigin 的宿主形态）
   try { writeEndpoint(ctx.webServer?.getOrigin?.()); apiEndpointSaved = !!ctx.webServer?.getOrigin?.(); } catch { /* ignore */ }
-  const callerAuthenticated = async (req) => {
-    const authHeader = String(req.headers?.authorization || '');
-    if (authHeader.startsWith('Bearer ') && bearerOk(authHeader.slice(7))) return true;
-    const admit = ctx.connection?.admit?.bind(ctx.connection);
-    if (typeof admit !== 'function') return false;
-    try { await admit(req); return true; } catch { return false; }
-  };
+  const callerAuthenticated = createCallerAuthenticated({ bearerOk, getAdmit: () => admitFn });
   const clientDiagWindow = { at: 0, n: 0 }; // P2-18：client-diag 节流窗口状态
   // A2 上下文注入缓存（声明在 webServer 路由闭包可见的作用域；配置变更时路由内置零）
   let readingCtxCache = { at: 0, text: '' };
@@ -1115,11 +1135,23 @@ export function apply(ctx, rawConfig = {}) {
       off = ctx.webServer.registerUpgrade({
         path: '/weread/ws',
         // v1.9.11：升级握手同认证（浏览器 cookie 自动携带；admit 异步判定后转交，失败拆线）
+        // v1.9.12 对抗审查加固：① admit 悬挂时 5s 超时拆线（防慢速占用连接）；② 补 .catch
+        // 兜底（callerAuthenticated 未来重构若 reject 也不悬挂 socket/未处理拒绝）；③ settled
+        // 防护——超时拆线后迟到的认证成功不再对已销毁 socket 转交 wsBus。
         handler: (req, socket, head) => {
-          void callerAuthenticated(req).then((ok) => {
-            if (ok) wsBus.handler(req, socket, head);
+          let settled = false;
+          const finish = (ok) => {
+            if (settled) return;
+            settled = true;
+            if (ok) { try { wsBus.handler(req, socket, head); } catch { try { socket.destroy(); } catch { /* ignore */ } } }
             else { try { socket.destroy(); } catch { /* ignore */ } }
-          });
+          };
+          const timer = setTimeout(() => finish(false), 5000);
+          timer.unref?.();
+          callerAuthenticated(req).then(
+            (ok) => { clearTimeout(timer); finish(ok); },
+            () => { clearTimeout(timer); finish(false); },
+          );
         },
       });
       logOp('INFO', 'weread ws 总线已注册（/weread/ws）');
@@ -1157,7 +1189,7 @@ export function apply(ctx, rawConfig = {}) {
         // 宿主无 connection 服务时 503，避免无认证裸奔）。此检查覆盖全部 /weread/api/* 路由，
         // 包括读取完整 API Key（/api/gateway/key）与私人笔记（notes/book/search 等）。
         if (!(await callerAuthenticated(req))) {
-          const admitAvailable = typeof ctx.connection?.admit === 'function';
+          const admitAvailable = typeof admitFn === 'function';
           return sendJson(res, admitAvailable ? 401 : 503, { error: admitAvailable ? 'authentication required' : 'authentication unavailable' });
         }
         const url = new URL(req.url ?? '/', 'http://localhost');

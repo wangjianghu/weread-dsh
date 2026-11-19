@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.9.12（2026-11-19）
+
+**Bug 修复：面板「加载失败：cannot get property "connection" without inject」（v1.9.11 引入的回归）。**
+
+- **问题**：v1.9.11 的宿主调用方认证在路由里直接读 `ctx.connection?.admit`。Cordis 的 Context 是服务解析代理，未在 `inject` 声明的服务属性一访问即抛 `cannot get property "connection" without inject`——`?.` 可选链无法绕过（抛错发生在属性返回之前）。浏览器请求无 Bearer 时每个 `/weread/api/*` 请求都走到这行，异常冒泡导致全量 500、面板加载失败，重试永远无效。
+- **修复**：改用动态注入 `ctx.inject(['connection'], cb)` 捕获 `admitFn`（服务在则激活、卸载即置空）；`callerAuthenticated` 与 401/503 判定全部改读捕获值。headless 组合（无 connection 服务）行为不变：插件照常工作，认证降级为仅 Bearer、无凭据 fail-closed（503）。不把 `connection` 加进顶层 `inject`——那会让 headless profile 里整个插件 inactive，违背设计。
+- **可测性**：`callerAuthenticated` 提取为导出的 `createCallerAuthenticated({ bearerOk, getAdmit })` 工厂。
+- **新增 9 例回归测试**（`test/callerauth.test.js`）：Bearer 通过/拒绝、admit 通过/抛错/中途撤除、getAdmit 逐请求求值、Cordis 守卫语义锚点（旧写法必抛、新写法可用）、源码扫描防 `ctx.connection` 直访回潮。smoke 的全部 mock ctx 补齐 `inject`。
+- **对抗审查加固（P1）**：`/weread/ws` 升级握手认证加 5s 超时拆线（admit 悬挂时防慢速占用）、`.catch` 兜底与 `settled` 防护（超时后迟到的认证成功不再对已销毁 socket 转交）。
+
 ## 1.9.11（2026-11-18）
 
 **安全修复：`/weread/*` 全量宿主调用方认证（dshopen #522 审核要求）。**

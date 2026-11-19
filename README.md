@@ -103,13 +103,13 @@ dsh plugin --profile desktop add weread-dsh
 
 **Install from npm** — published as [`weread-dsh`](https://www.npmjs.com/package/weread-dsh); replace the profile name as needed.
 
-**方式三：直装（pin 到 v1.9.10 对应 commit）**
+**方式三：直装（pin 到 v1.9.12 对应 tag）**
 
 ```bash
-dsh plugin --profile desktop add "git+https://github.com/wangjianghu/weread-dsh.git#23b36f0475dcf0f57da7eac28e13850f8392bcee"
+dsh plugin --profile desktop add "git+https://github.com/wangjianghu/weread-dsh.git#v1.9.12"
 ```
 
-**Install pinned to a commit** — the command above pins the exact v1.9.10 commit.
+**Install pinned to a tag** — the command above pins the exact v1.9.12 release tag.
 
 **方式四：本地目录安装** —— DSH 插件页 **Add plugin** 选择本仓库目录（开发模式）。
 
@@ -183,7 +183,7 @@ Claude Code 配置样例（`~/Library/Application Support/Claude/claude_desktop_
 ## 开发与测试
 
 - **client.js 是构建产物**：业务代码在 `parts/*.js`（00-head → 90-tail 顺序拼接）。改 parts 后必须 `npm run build` 重建，**不要直接改 client.js**；`npm run check` 可校验产物与 parts 是否一致。
-- **测试**：`npm install && npm test` 串跑——`build.mjs --check`（parts→client.js 一致性）、`node --test test/`（单元测试 149 例：markdown/store/analytics/zip/sync/api/auth/gateway/wsbus，零新依赖）、`smoke.mjs`（后端 400+ 断言，fake ctx 不触网）、`rmsmoke.mjs`（组件渲染 + 文案/i18n 断言）、`tools/react-mount-test.mjs`（真实 React 挂载 App/dock/侧栏 + @选书形状守卫，防面板空白类回归）、`tools/mcp-server.mjs --selftest`（MCP 全链路含异常路径）。每次改动后必跑。
+- **测试**：`npm install && npm test` 串跑——`build.mjs --check`（parts→client.js 一致性）、`node --test test/`（单元测试 163 例：markdown/store/analytics/zip/sync/api/auth/gateway/wsbus，零新依赖）、`smoke.mjs`（后端 400+ 断言，fake ctx 不触网）、`rmsmoke.mjs`（组件渲染 + 文案/i18n 断言）、`tools/react-mount-test.mjs`（真实 React 挂载 App/dock/侧栏 + @选书形状守卫，防面板空白类回归）、`tools/mcp-server.mjs --selftest`（MCP 全链路含异常路径）。每次改动后必跑。
 - **版本记录**：见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 发版流程
@@ -192,6 +192,7 @@ Claude Code 配置样例（`~/Library/Application Support/Claude/claude_desktop_
 
 ## 安全模型
 
+- **面板加载失败修复（v1.9.12）**：v1.9.11 的认证代码直接读取宿主 `connection` 服务触发框架守卫异常，浏览器面板全量 500；现改为动态注入捕获，桌面/headless 两种宿主形态均正常（163 例单测回归覆盖）。 / **Panel load-failure fix (v1.9.12)**: v1.9.11 auth code read the host `connection` service directly and tripped the framework guard, 500-ing every panel request; now captured via dynamic injection — both desktop and headless hosts work (covered by 163 unit tests).
 - **宿主调用方认证（v1.9.11）**：`/weread/*` 全部 HTTP 路由与 WS 升级须持有其一凭据——宿主签名 cookie（`ctx.connection.admit`，DSH 页面同源请求自动携带）或插件自签 Bearer token（随 `endpoint.json` 分发给 MCP 等本地工具，timing-safe 比较）。本机其他进程无法再匿名读取完整 API Key 或私人笔记；宿主无 `connection` 服务（headless 组合）且无 Bearer 时拒绝服务（fail-closed）。
 - 本插件在本机开启仅 loopback（127.0.0.1/localhost/::1，可带端口）的 HTTP/WS 服务；带 Origin 的浏览器请求要求 Origin host 与 Host 一致且为 loopback（防 DNS rebinding），无 Origin 的本地工具凭 loopback Host 放行。
 - 微信读书凭据（cookie / API Key）只存本机 `~/.dsh/weread`（secrets 文件 0600 权限位），不经任何第三方服务；登录二维码本地生成。

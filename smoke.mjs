@@ -19,6 +19,8 @@ const ctx = {
   tools: { register: (t) => registrations.tools.push(t) },
   systemPrompt: { context: (d) => { registrations.systemPrompt.push(d); return () => {}; } },
   // v1.9.11：模拟「宿主在场但请求未携带认证 cookie」——admit 恒拒，冒烟全链必须持 Bearer token
+  // v1.9.12：admit 经 ctx.inject(['connection']) 动态注入捕获（mock 立即激活，语义等价）
+  inject: (deps, cb) => cb({ connection: { admit: async () => { throw new Error('no browser session'); } } }),
   connection: { admit: async () => { throw new Error('no browser session'); } },
 };
 const dispose = apply(ctx, { stateDir: path.join(tmp, 'state'), outputPath: '', apiToken: SMOKE_TOKEN });
@@ -208,7 +210,7 @@ ok(r.payload.index >= 1, 'next 前进');
 const beforeRestart = r.payload;
 dispose();
 const reg2 = { web: [], tools: [] };
-const ctx2 = { effect: (fn) => { fn(); return () => {}; }, webServer: { register: (x) => reg2.web.push(x) }, tools: { register: (x) => reg2.tools.push(x) } };
+const ctx2 = { effect: (fn) => { fn(); return () => {}; }, inject: () => () => {}, webServer: { register: (x) => reg2.web.push(x) }, tools: { register: (x) => reg2.tools.push(x) } };
 const dispose2 = apply(ctx2, { stateDir: path.join(tmp, 'state'), outputPath: '', apiToken: SMOKE_TOKEN });
 route = reg2.web.find((x) => x.path === '/weread');
 tool = reg2.tools.find((x) => x.name === 'weread');
@@ -241,7 +243,7 @@ for (const m of dueKeys) m.sm2Due = Date.now() - 1000;
 fs.writeFileSync(metaFile, JSON.stringify(metaRaw));
 dispose2();
 const reg3 = { web: [], tools: [] };
-const ctx3 = { effect: (fn) => { fn(); return () => {}; }, webServer: { register: (x) => reg3.web.push(x) }, tools: { register: (x) => reg3.tools.push(x) } };
+const ctx3 = { effect: (fn) => { fn(); return () => {}; }, inject: () => () => {}, webServer: { register: (x) => reg3.web.push(x) }, tools: { register: (x) => reg3.tools.push(x) } };
 const dispose3 = apply(ctx3, { stateDir: path.join(tmp, 'state'), outputPath: '', apiToken: SMOKE_TOKEN });
 route = reg3.web.find((x) => x.path === '/weread');
 tool = reg3.tools.find((x) => x.name === 'weread');
@@ -1818,7 +1820,7 @@ ok(r.payload.gateway && r.payload.gateway.enabled === false && r.payload.gateway
 // 13.75 v1.7.4 路由级回归：open-reader 503 / diagnose / close（readerDeps 注入，不拉真 Chrome）
 {
   const regRW = { web: [], tools: [] };
-  const ctxRW = { effect: (fn) => { fn(); return () => {}; }, webServer: { register: (x) => regRW.web.push(x) }, tools: { register: (x) => regRW.tools.push(x) } };
+  const ctxRW = { effect: (fn) => { fn(); return () => {}; }, inject: () => () => {}, webServer: { register: (x) => regRW.web.push(x) }, tools: { register: (x) => regRW.tools.push(x) } };
   const disposeRW = apply(ctxRW, { stateDir: path.join(tmp, 'state-rw-route'), outputPath: '', apiToken: SMOKE_TOKEN, readerDeps: { chromeExecutable: () => null } });
   const routeRW = regRW.web.find((x) => x.path === '/weread');
   // v1.9.11：隔离 stateDir 场景有独立自签 token——种子重取（局部持有，不动主场景 API_TOKEN）
@@ -2225,7 +2227,7 @@ ok(r.payload.gateway && r.payload.gateway.enabled === false && r.payload.gateway
 // 13.79 v1.7.6 反向同步采纳（apply 级，fetch 桩裁决）：窗内有效会话救活插件 Cookie 通道
 {
   const regS = { web: [], tools: [] };
-  const ctxS = { effect: (fn) => { fn(); return () => {}; }, webServer: { register: (x) => regS.web.push(x) }, tools: { register: (x) => regS.tools.push(x) } };
+  const ctxS = { effect: (fn) => { fn(); return () => {}; }, inject: () => () => {}, webServer: { register: (x) => regS.web.push(x) }, tools: { register: (x) => regS.tools.push(x) } };
   const FUTURE2 = Math.floor(Date.now() / 1000) + 86400;
   const worldS = { alive: false, targets: [], url: 'https://weread.qq.com/web/reader/sync1' };
   const tgtS = () => ({ id: 'SY0', type: 'page', url: worldS.url, webSocketDebuggerUrl: 'ws://127.0.0.1:47865/devtools/page/SY0' });
@@ -2433,7 +2435,7 @@ ok(r.payload.gateway && r.payload.gateway.enabled === false && r.payload.gateway
 // 13.79b v1.9.0 C2：启动救活——插件凭据已死 + 窗口孤儿实例在场（窗内会话有效）→ 启动后台校验后自动采纳
 {
   const regR = { web: [], tools: [] };
-  const ctxR = { effect: (fn) => { fn(); return () => {}; }, webServer: { register: (x) => regR.web.push(x) }, tools: { register: (x) => regR.tools.push(x) } };
+  const ctxR = { effect: (fn) => { fn(); return () => {}; }, inject: () => () => {}, webServer: { register: (x) => regR.web.push(x) }, tools: { register: (x) => regR.tools.push(x) } };
   const FUTURE4 = Math.floor(Date.now() / 1000) + 86400;
   // 预置：插件凭据 S_OLD（服务端将判死）+ 孤儿窗口在场（S_ORPH 有效）
   // 注意：目录名必须全新（不能撞早期测试用过的 state-rescue——那里预置过账号 999，meta 会把 cookie 查到 999 scope 上）
@@ -2620,7 +2622,7 @@ ok(r.payload.gateway && r.payload.gateway.enabled === false && r.payload.gateway
     const regAK = { web: [], tools: [] };
     const followups = [];
     const ctxAK = {
-      effect: (fn) => { fn(); return () => {}; },
+      effect: (fn) => { fn(); return () => {}; }, inject: () => () => {},
       get: (name) => (name === 'agents' ? { roots: () => [{ id: 'sess-live-9', session: 'sess-live-9', status: 'idle', followup: (m) => followups.push(m) }] } : undefined),
       webServer: { register: (x) => regAK.web.push(x) },
       tools: { register: (x) => regAK.tools.push(x) },
@@ -2680,7 +2682,7 @@ ok(r.payload.gateway && r.payload.gateway.enabled === false && r.payload.gateway
 r = await call('POST', '/weread/api/config', { keychain: false });
 dispose3();
 const reg4 = { web: [], tools: [] };
-const ctx4 = { effect: (fn) => { fn(); return () => {}; }, webServer: { register: (x) => reg4.web.push(x) }, tools: { register: (x) => reg4.tools.push(x) } };
+const ctx4 = { effect: (fn) => { fn(); return () => {}; }, inject: () => () => {}, webServer: { register: (x) => reg4.web.push(x) }, tools: { register: (x) => reg4.tools.push(x) } };
 const dispose4 = apply(ctx4, { stateDir: path.join(tmp, 'state'), outputPath: '', apiToken: SMOKE_TOKEN });
 route = reg4.web.find((x) => x.path === '/weread');
 r = await call('POST', '/weread/api/uninstall/cleanup');

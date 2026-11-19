@@ -1,6 +1,6 @@
 {
   "name": "weread-dsh",
-  "version": "1.9.11",
+  "version": "1.9.12",
   "type": "module",
   "license": "GPL-3.0",
   "description": "微信读书：笔记同步、Markdown 导出、笔记搜索、阅读洞察与笔记漫游（由 weread-vscode 0.1.2 VSIX 改造）",
