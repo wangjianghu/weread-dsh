@@ -8,6 +8,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { execFile } from 'node:child_process';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { createStore } from './lib/store.js';
 import { createAuthManager } from './lib/auth.js';
 import * as api from './lib/api.js';
@@ -27,6 +28,15 @@ import { collectDirEntries, writeZipFile } from './lib/zip.mjs';
 // 配置默认值在 apply(rawConfig) 内联,运行时改动经 /api/config 写入 stateDir/prefs.json。
 export const inject = ['webServer', 'tools', 'systemPrompt', 'commands', 'fs', 'agents'];
 // systemPrompt 为可选增强（A2 阅读上下文注入），在 apply 内经 ctx.inject 可选接入。
+
+/** v1.9.11 宿主调用方认证：常时比较两个令牌字符串（timing-safe；长度差异提前返回不泄密）。 */
+export function safeTokenEqual(presented, expected) {
+  if (typeof presented !== 'string' || typeof expected !== 'string') return false;
+  const a = Buffer.from(presented, 'utf8');
+  const b = Buffer.from(expected, 'utf8');
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(a, b);
+}
 
 
 const DEFAULT_THEMES = [
@@ -1067,6 +1077,32 @@ export function apply(ctx, rawConfig = {}) {
   };
 
   let apiEndpointSaved = false;
+  // v1.9.11 宿主调用方认证（dshopen #522 审核要求）：本机任意进程都能匿名访问 loopback 的
+  // /weread/api（含读取完整 API Key 与私人笔记的接口）——插件账号已登录不代表请求来自宿主
+  // 所有者。双通道收口：
+  //   ① 浏览器（宿主页面）：经 ctx.connection.admit（dsh-auth 签名 cookie，同源请求自动携带）；
+  //   ② MCP/本地工具：经插件自签 Bearer token（随机 32 字节，随 endpoint.json 分发，0600 目录）。
+  // 二者其一通过才放行；ctx.connection 不在（headless 组合）且无 Bearer 时 fail-closed（503）。
+  // token 仅存内存与 endpoint.json，绝不写日志。rawConfig.apiToken 可显式指定（供测试/托管
+  // 场景固定凭据；生产配置无此项时随机生成）。
+  const localApiToken = (typeof rawConfig.apiToken === 'string' && rawConfig.apiToken.trim().length >= 16)
+    ? rawConfig.apiToken.trim()
+    : randomBytes(32).toString('hex');
+  const bearerOk = (presented) => safeTokenEqual(presented, localApiToken);
+  const writeEndpoint = (baseUrl) => {
+    try {
+      fs.writeFileSync(path.join(stateDir, 'endpoint.json'), JSON.stringify({ baseUrl, token: localApiToken, savedAt: Date.now() }, null, 2));
+    } catch { /* 尽力而为 */ }
+  };
+  // 激活即写一份（getOrigin 可用时）；首个请求再按 Host 头刷新（覆盖无 getOrigin 的宿主形态）
+  try { writeEndpoint(ctx.webServer?.getOrigin?.()); apiEndpointSaved = !!ctx.webServer?.getOrigin?.(); } catch { /* ignore */ }
+  const callerAuthenticated = async (req) => {
+    const authHeader = String(req.headers?.authorization || '');
+    if (authHeader.startsWith('Bearer ') && bearerOk(authHeader.slice(7))) return true;
+    const admit = ctx.connection?.admit?.bind(ctx.connection);
+    if (typeof admit !== 'function') return false;
+    try { await admit(req); return true; } catch { return false; }
+  };
   const clientDiagWindow = { at: 0, n: 0 }; // P2-18：client-diag 节流窗口状态
   // A2 上下文注入缓存（声明在 webServer 路由闭包可见的作用域；配置变更时路由内置零）
   let readingCtxCache = { at: 0, text: '' };
@@ -1076,7 +1112,16 @@ export function apply(ctx, rawConfig = {}) {
   ctx.effect(() => {
     let off = null;
     try {
-      off = ctx.webServer.registerUpgrade({ path: '/weread/ws', handler: wsBus.handler });
+      off = ctx.webServer.registerUpgrade({
+        path: '/weread/ws',
+        // v1.9.11：升级握手同认证（浏览器 cookie 自动携带；admit 异步判定后转交，失败拆线）
+        handler: (req, socket, head) => {
+          void callerAuthenticated(req).then((ok) => {
+            if (ok) wsBus.handler(req, socket, head);
+            else { try { socket.destroy(); } catch { /* ignore */ } }
+          });
+        },
+      });
       logOp('INFO', 'weread ws 总线已注册（/weread/ws）');
     } catch (e) { logOp('WARN', `weread ws 注册失败（客户端降级轮询）：${e.message}`); }
     track(() => { try { off?.(); } catch { /* ignore */ } try { wsBus.dispose(); } catch { /* ignore */ } });
@@ -1105,9 +1150,15 @@ export function apply(ctx, rawConfig = {}) {
         // v0.4 MCP 端点发现：首个请求记录 base URL（mcp-server.mjs 据此找到本 API）
         if (!apiEndpointSaved && req.headers?.host) {
           apiEndpointSaved = true;
-          try {
-            fs.writeFileSync(path.join(stateDir, 'endpoint.json'), JSON.stringify({ baseUrl: `http://${req.headers.host}`, savedAt: Date.now() }, null, 2));
-          } catch { /* 尽力而为 */ }
+          writeEndpoint(`http://${req.headers.host}`);
+        }
+        // v1.9.11 宿主调用方认证（dshopen #522）：Bearer token（MCP/本地工具）或
+        // ctx.connection.admit（宿主签名 cookie）其一通过；均不可用/均失败 → 401（fail-closed：
+        // 宿主无 connection 服务时 503，避免无认证裸奔）。此检查覆盖全部 /weread/api/* 路由，
+        // 包括读取完整 API Key（/api/gateway/key）与私人笔记（notes/book/search 等）。
+        if (!(await callerAuthenticated(req))) {
+          const admitAvailable = typeof ctx.connection?.admit === 'function';
+          return sendJson(res, admitAvailable ? 401 : 503, { error: admitAvailable ? 'authentication required' : 'authentication unavailable' });
         }
         const url = new URL(req.url ?? '/', 'http://localhost');
         const pathname = url.pathname;

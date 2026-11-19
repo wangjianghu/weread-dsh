@@ -83,6 +83,38 @@
 - 漫游导图由浏览器 Canvas 生成后直接下载 PNG；洞察月报写入 `输出目录/阅读洞察报告/`。
 - macOS 隐私设置深链未保留，权限错误以文案提示。
 
+## 安装（四选一）
+
+**方式一：插件市场（推荐）** —— 在 DSH 的 **插件 → 发现 → 添加索引源** 粘贴本仓库自托管索引：
+
+```
+https://raw.githubusercontent.com/wangjianghu/weread-dsh/main/market/index.json
+```
+
+之后在发现页找到「微信读书笔记（weread-dsh）」点安装。（需先启用实验性 **Custom plugin indexes** bundle）
+
+**Install via market (recommended)** — DSH **Plugins → Discover → Add index source**, paste the self-hosted index URL above, then install *WeRead Notes (weread-dsh)* from the Discover list.
+
+**方式二：npm 安装**
+
+```bash
+dsh plugin --profile desktop add weread-dsh
+```
+
+**Install from npm** — published as [`weread-dsh`](https://www.npmjs.com/package/weread-dsh); replace the profile name as needed.
+
+**方式三：直装（pin 到 v1.9.10 对应 commit）**
+
+```bash
+dsh plugin --profile desktop add "git+https://github.com/wangjianghu/weread-dsh.git#23b36f0475dcf0f57da7eac28e13850f8392bcee"
+```
+
+**Install pinned to a commit** — the command above pins the exact v1.9.10 commit.
+
+**方式四：本地目录安装** —— DSH 插件页 **Add plugin** 选择本仓库目录（开发模式）。
+
+**Install from a local directory** — **Plugins → Add plugin** with this repository directory (development mode).
+
 ## 使用
 
 1. DSH 安装本 bundle，侧栏点「微信读书」。
@@ -160,7 +192,8 @@ Claude Code 配置样例（`~/Library/Application Support/Claude/claude_desktop_
 
 ## 安全模型
 
-- 本插件在本机开启仅 loopback（127.0.0.1/localhost/::1，可带端口）的 HTTP/WS 服务；带 Origin 的浏览器请求要求 Origin host 与 Host 一致且为 loopback（防 DNS rebinding），无 Origin 的本地工具（MCP 等）凭 loopback Host 放行。
+- **宿主调用方认证（v1.9.11）**：`/weread/*` 全部 HTTP 路由与 WS 升级须持有其一凭据——宿主签名 cookie（`ctx.connection.admit`，DSH 页面同源请求自动携带）或插件自签 Bearer token（随 `endpoint.json` 分发给 MCP 等本地工具，timing-safe 比较）。本机其他进程无法再匿名读取完整 API Key 或私人笔记；宿主无 `connection` 服务（headless 组合）且无 Bearer 时拒绝服务（fail-closed）。
+- 本插件在本机开启仅 loopback（127.0.0.1/localhost/::1，可带端口）的 HTTP/WS 服务；带 Origin 的浏览器请求要求 Origin host 与 Host 一致且为 loopback（防 DNS rebinding），无 Origin 的本地工具凭 loopback Host 放行。
 - 微信读书凭据（cookie / API Key）只存本机 `~/.dsh/weread`（secrets 文件 0600 权限位），不经任何第三方服务；登录二维码本地生成。
 - 单例阅读窗口使用 CDP 调试端口（仅 127.0.0.1，窗口存活期间存在）。这是 Chrome CDP 的固有暴露面：存活期间本机任意进程可经调试端口读取页面会话。介意者可在设置中开启「关窗即退出」缩小存活期。
 - 卸载清理为销毁性操作，API 层要求显式 `confirm: true`。

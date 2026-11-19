@@ -1,0 +1,104 @@
+{
+  "format": 1,
+  "title": {
+    "en": "weread-dsh plugin index",
+    "zh": "weread-dsh 插件索引"
+  },
+  "description": {
+    "en": "Self-hosted format-1 market index for the weread-dsh plugin.",
+    "zh": "weread-dsh 插件的自托管 format-1 市场索引。"
+  },
+  "metadata": {
+    "categories": {
+      "productivity": {
+        "title": {
+          "en": "Productivity",
+          "zh": "效率"
+        }
+      }
+    },
+    "labels": {
+      "notes": {
+        "title": {
+          "en": "Notes",
+          "zh": "笔记"
+        }
+      },
+      "ai": {
+        "title": {
+          "en": "AI Integrated",
+          "zh": "AI 集成"
+        }
+      },
+      "mcp": {
+        "title": {
+          "en": "MCP",
+          "zh": "MCP"
+        }
+      }
+    }
+  },
+  "plugins": [
+    {
+      "name": "weread-dsh",
+      "title": {
+        "en": "WeRead Notes (weread-dsh)",
+        "zh": "微信读书笔记（weread-dsh）"
+      },
+      "description": {
+        "en": "WeRead notes, deeply wired into DeepSeek Harness and AI workflows: one-click Markdown sync and export, full-text search, reading insights, SM-2 note roaming, in-session agent tools, reading-context injection, and a cross-host MCP server.",
+        "zh": "微信读书笔记 × DeepSeek Harness / AI 工作流：一键同步导出 Markdown、全文搜索、阅读洞察、SM-2 笔记漫游、会话内 Agent 工具、近期阅读上下文注入、跨宿主 MCP 服务。"
+      },
+      "icon": "icon.svg",
+      "author": "wangjianghu",
+      "homepage": "https://github.com/wangjianghu/weread-dsh",
+      "repository": {
+        "url": "https://github.com/wangjianghu/weread-dsh"
+      },
+      "metadata": {
+        "category": "productivity",
+        "keywords": [
+          "weread",
+          "notes",
+          "markdown",
+          "reading",
+          "insights",
+          "ai",
+          "mcp",
+          "dsh"
+        ],
+        "labels": [
+          "notes",
+          "ai",
+          "mcp"
+        ]
+      },
+      "versions": [
+        {
+          "version": "1.9.11",
+          "publishTimestamp": 1794971767,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/wangjianghu/weread-dsh",
+            "commit": "87c58bf7df59e1d0fea7a3a930091748721bca18"
+          },
+          "engines": {
+            "dsh": ">=0.2.0"
+          }
+        },
+        {
+          "version": "1.9.10",
+          "publishTimestamp": 1794844094,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/wangjianghu/weread-dsh",
+            "commit": "23b36f0475dcf0f57da7eac28e13850f8392bcee"
+          },
+          "engines": {
+            "dsh": ">=0.2.0"
+          }
+        }
+      ]
+    }
+  ]
+}

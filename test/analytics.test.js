@@ -5,10 +5,13 @@ import { createAnalyticsService } from '../lib/analytics.js';
 
 const DAY = 24 * 60 * 60 * 1000;
 
-function tsDaysAgo(days, hour = 10) {
+function tsDaysAgo(days, hour) {
+  // v1.9.11 修复：原 hour=10 固定对齐导致「上午 10 点前跑测试」时 tsDaysAgo(0) 落在未来，
+  // 被分析窗口当异常数据过滤（2026-11-18 09:36 实测 5 用例假挂）。改为保留当前时分秒的
+  // 相对偏移：days 间隔 ≥1 保证日历天聚合稳定，且任何时刻跑都不产生未来时间戳。
   const d = new Date();
   d.setDate(d.getDate() - days);
-  d.setHours(hour, 0, 0, 0);
+  if (hour !== undefined) d.setHours(hour, 0, 0, 0);
   return Math.floor(d.getTime() / 1000);
 }
 

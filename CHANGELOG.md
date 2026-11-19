@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.9.11（2026-11-18）
+
+**安全修复：`/weread/*` 全量宿主调用方认证（dshopen #522 审核要求）。**
+
+- **问题**：本机任意进程可匿名访问 loopback 的 `/weread/api/*`——包括读取完整 API Key（`/api/gateway/key`）与全部私人笔记的接口。插件账号已登录不代表请求来自宿主所有者（原有防护只覆盖 DNS rebinding 与跨域网页，不覆盖本地非宿主进程）。
+- **修复（双通道，其一通过才放行）**：① 浏览器/宿主页面经 `ctx.connection.admit`（DSH 的 dsh-auth 签名 cookie，同源请求自动携带）；② MCP/本地工具经插件自签 Bearer token（激活时随机 32 字节，随 `endpoint.json` 分发，timing-safe 比较）。`/weread/ws` 升级握手同认证。宿主无 `connection` 服务（headless 组合）且无 Bearer 时 fail-closed（503）。
+- **MCP**：`tools/mcp-server.mjs` 自动读取 `endpoint.json` 的 `token` 字段随请求携带；支持 `--token` 参数与 `WEREAD_DSH_TOKEN` 环境变量；401/503 报错含升级引导。
+- **兼容性**：客户端无需改动（同源 cookie 自动携带）；旧版 endpoint.json 无 token 字段时重启 DSH 由插件重写补齐。
+- 新增 5 例 timing-safe 比较单测；smoke 增加无凭据 401 / 错 token 401 断言。
+
 ## 1.9.10（2026-11-16）
 
 **对抗审查 v3（性能/稳定性专项）：全面复核 + 死代码清理。**

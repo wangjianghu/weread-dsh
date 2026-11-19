@@ -11,13 +11,17 @@ const outDir = path.join(tmp, 'notes');
 const smokeKiller = setTimeout(() => { console.error('SMOKE GLOBAL TIMEOUT (180s)'); process.exit(1); }, 180_000);
 smokeKiller.unref?.();
 const registrations = { web: [], tools: [], systemPrompt: [], upgrade: [] };
+// v1.9.11：全场景固定自签 token（经 rawConfig.apiToken 注入；生产无此配置时插件随机生成）
+const SMOKE_TOKEN = 'smoke-fixed-token-0123456789abcdef0123456789abcdef';
 const ctx = {
   effect: (fn) => { fn(); return () => {}; },
   webServer: { register: (r) => registrations.web.push(r), registerUpgrade: (r) => { registrations.upgrade.push(r); return () => {}; } },
   tools: { register: (t) => registrations.tools.push(t) },
   systemPrompt: { context: (d) => { registrations.systemPrompt.push(d); return () => {}; } },
+  // v1.9.11：模拟「宿主在场但请求未携带认证 cookie」——admit 恒拒，冒烟全链必须持 Bearer token
+  connection: { admit: async () => { throw new Error('no browser session'); } },
 };
-const dispose = apply(ctx, { stateDir: path.join(tmp, 'state'), outputPath: '' });
+const dispose = apply(ctx, { stateDir: path.join(tmp, 'state'), outputPath: '', apiToken: SMOKE_TOKEN });
 
 let route = registrations.web.find((r) => r.path === '/weread');
 if (!route) throw new Error('webServer 路由未注册');
@@ -26,10 +30,24 @@ if (!tool) throw new Error('工具 weread 未注册');
 
 let asserts = 0; const ok = (cond, msg) => { if (!cond) throw new Error('FAIL: ' + msg); asserts++; console.log('  ✓', msg); };
 
-async function call(method, pathname, body, routeOverride) {
+// v1.9.11 宿主调用方认证：固定 token 全链携带；验证无凭据/错 token 两条拒绝路径 + endpoint 分发。
+let API_TOKEN = SMOKE_TOKEN;
+{
+  const seed = await call('GET', '/weread/api/state', null, null, '');
+  ok(seed.status === 401 && seed.payload?.error === 'authentication required', '无凭据请求被拒（401，admit 拒绝 + 无 Bearer）');
+  const ep = JSON.parse(fs.readFileSync(path.join(tmp, 'state', 'endpoint.json'), 'utf8'));
+  ok(ep.token === SMOKE_TOKEN, 'endpoint.json 分发自签 token（与配置一致）');
+  const bad = await call('GET', '/weread/api/state', null, null, 'Bearer wrong-token-xxx');
+  ok(bad.status === 401, '错误 Bearer token 被拒（401）');
+}
+
+async function call(method, pathname, body, routeOverride, bearerOverride) {
   const chunks = body ? [JSON.stringify(body)] : [];
   // P0-1 伴生：路由现在强校验 loopback Host（防 DNS rebinding），伪造 req 须带真实形状的 headers。
-  const req = { method, url: pathname, headers: { host: '127.0.0.1:65414' }, on: (ev, cb) => { if (ev === 'data') for (const c of chunks) cb(c); if (ev === 'end') setTimeout(cb, 0); } };
+  // v1.9.11：默认携带插件 Bearer token（种子/负面用例经 bearerOverride 控制）。
+  const headers = { host: '127.0.0.1:65414' };
+  if (bearerOverride !== null) headers.authorization = bearerOverride ?? `Bearer ${API_TOKEN}`;
+  const req = { method, url: pathname, headers, on: (ev, cb) => { if (ev === 'data') for (const c of chunks) cb(c); if (ev === 'end') setTimeout(cb, 0); } };
   let status = 0; let payload = null;
   const res = { writeHead: (s) => { status = s; }, end: (txt) => { payload = txt ? JSON.parse(txt) : null; } };
   await (routeOverride ?? route).handler(req, res);
@@ -55,7 +73,7 @@ ok(r.payload.lines.some((l) => l.includes('[client] smoke 测试信使')), 'clie
   const { createSvg } = await import('./lib/vendor/qrcode/index.cjs');
   const svg = createSvg('https://weread.qq.com/web/confirm?uid=smoke123', { margin: 2 });
   ok(svg.startsWith('<svg') && svg.includes('</svg>') && svg.includes('shape-rendering'), 'vendored qrcode 生成合法 SVG（本地无外网依赖）');
-  const req2 = { method: 'GET', url: '/weread/api/login/protocol/qrcode?data=' + encodeURIComponent('https://weread.qq.com/web/confirm?uid=smoke123'), headers: { host: '127.0.0.1:65414' } };
+  const req2 = { method: 'GET', url: '/weread/api/login/protocol/qrcode?data=' + encodeURIComponent('https://weread.qq.com/web/confirm?uid=smoke123'), headers: { host: '127.0.0.1:65414', authorization: `Bearer ${API_TOKEN}` } };
   let code2 = 0; let body2 = '';
   const res2 = { writeHead: (c) => { code2 = c; }, end: (t) => { body2 = String(t ?? ''); } };
   await route.handler(req2, res2);
@@ -191,10 +209,13 @@ const beforeRestart = r.payload;
 dispose();
 const reg2 = { web: [], tools: [] };
 const ctx2 = { effect: (fn) => { fn(); return () => {}; }, webServer: { register: (x) => reg2.web.push(x) }, tools: { register: (x) => reg2.tools.push(x) } };
-const dispose2 = apply(ctx2, { stateDir: path.join(tmp, 'state'), outputPath: '' });
+const dispose2 = apply(ctx2, { stateDir: path.join(tmp, 'state'), outputPath: '', apiToken: SMOKE_TOKEN });
 route = reg2.web.find((x) => x.path === '/weread');
 tool = reg2.tools.find((x) => x.name === 'weread');
 ok(!!route && !!tool, '重启后路由/工具重新注册');
+// v1.9.11：重启后插件重新生成自签 token——种子请求触发 endpoint.json 重写（认证前写入），重取后继续
+await call('GET', '/weread/api/state', null, null, 'Bearer stale-token-after-restart');
+API_TOKEN = JSON.parse(fs.readFileSync(path.join(tmp, 'state', 'endpoint.json'), 'utf8')).token;
 r = await call('GET', '/weread/api/roaming/session');
 ok(r.status === 200 && r.payload.card?.noteKey === beforeRestart.card?.noteKey, '重启后漫游续读（同一张卡）');
 ok(r.payload.index === beforeRestart.index && r.payload.total === beforeRestart.total, '重启后位置/总数保持');
@@ -221,9 +242,12 @@ fs.writeFileSync(metaFile, JSON.stringify(metaRaw));
 dispose2();
 const reg3 = { web: [], tools: [] };
 const ctx3 = { effect: (fn) => { fn(); return () => {}; }, webServer: { register: (x) => reg3.web.push(x) }, tools: { register: (x) => reg3.tools.push(x) } };
-const dispose3 = apply(ctx3, { stateDir: path.join(tmp, 'state'), outputPath: '' });
+const dispose3 = apply(ctx3, { stateDir: path.join(tmp, 'state'), outputPath: '', apiToken: SMOKE_TOKEN });
 route = reg3.web.find((x) => x.path === '/weread');
 tool = reg3.tools.find((x) => x.name === 'weread');
+// v1.9.11：第三次 apply 同样重生成 token——种子重取（endpoint 写入先于认证）
+await call('GET', '/weread/api/state', null, null, 'Bearer stale-token-restart-3');
+API_TOKEN = JSON.parse(fs.readFileSync(path.join(tmp, 'state', 'endpoint.json'), 'utf8')).token;
 r = await call('POST', '/weread/api/roaming/action', { action: 'reviewStart' });
 ok(r.payload.reviewMode === true && r.payload.card, '今日复习出到期卡');
 ok(typeof r.payload.dueRemaining === 'number' && r.payload.dueRemaining >= 0, '复习模式剩余计数');
@@ -1795,13 +1819,17 @@ ok(r.payload.gateway && r.payload.gateway.enabled === false && r.payload.gateway
 {
   const regRW = { web: [], tools: [] };
   const ctxRW = { effect: (fn) => { fn(); return () => {}; }, webServer: { register: (x) => regRW.web.push(x) }, tools: { register: (x) => regRW.tools.push(x) } };
-  const disposeRW = apply(ctxRW, { stateDir: path.join(tmp, 'state-rw-route'), outputPath: '', readerDeps: { chromeExecutable: () => null } });
+  const disposeRW = apply(ctxRW, { stateDir: path.join(tmp, 'state-rw-route'), outputPath: '', apiToken: SMOKE_TOKEN, readerDeps: { chromeExecutable: () => null } });
   const routeRW = regRW.web.find((x) => x.path === '/weread');
-  let rq = await call('POST', '/weread/api/open-reader', { url: 'https://weread.qq.com/web/reader/route' }, routeRW);
+  // v1.9.11：隔离 stateDir 场景有独立自签 token——种子重取（局部持有，不动主场景 API_TOKEN）
+  await call('GET', '/weread/api/state', null, routeRW, 'Bearer stale-rw');
+  const rwToken = JSON.parse(fs.readFileSync(path.join(tmp, 'state-rw-route', 'endpoint.json'), 'utf8')).token;
+  const rwAuth = `Bearer ${rwToken}`;
+  let rq = await call('POST', '/weread/api/open-reader', { url: 'https://weread.qq.com/web/reader/route' }, routeRW, rwAuth);
   ok(rq.status === 503 && rq.payload.ok === false && rq.payload.mode === 'no-chrome', 'open-reader 无 Chrome → 503 + mode=no-chrome（不用默认浏览器）');
-  rq = await call('GET', '/weread/api/open-reader/diagnose', undefined, routeRW);
+  rq = await call('GET', '/weread/api/open-reader/diagnose', undefined, routeRW, rwAuth);
   ok(rq.status === 200 && rq.payload.chromeFound === false && rq.payload.windowAlive === false, 'diagnose 路由返回自检结构');
-  rq = await call('POST', '/weread/api/open-reader/close', {}, routeRW);
+  rq = await call('POST', '/weread/api/open-reader/close', {}, routeRW, rwAuth);
   ok(rq.status === 200 && rq.payload.ok === false, 'close 路由：窗口未运行时 ok=false 不误报');
   disposeRW();
 }
@@ -2264,39 +2292,43 @@ ok(r.payload.gateway && r.payload.gateway.enabled === false && r.payload.gateway
     return origFetch(input, init);
   };
   try {
-    const disposeS = apply(ctxS, { stateDir: path.join(tmp, 'state-sess-sync'), outputPath: '', readerDeps: depsS, getAccountId: () => '' }); // v1.8.10：固定单账号（会话互通断言基于同窗复用）
+    const disposeS = apply(ctxS, { stateDir: path.join(tmp, 'state-sess-sync'), outputPath: '', apiToken: SMOKE_TOKEN, readerDeps: depsS, getAccountId: () => '' }); // v1.8.10：固定单账号（会话互通断言基于同窗复用）
     const routeS = regS.web.find((x) => x.path === '/weread');
-    let rs = await call('POST', '/weread/api/open-reader', { url: 'https://weread.qq.com/web/reader/sync1' }, routeS);
+    // v1.9.11：隔离 stateDir 场景局部 token（种子重取，不动主场景 API_TOKEN）
+    await call('GET', '/weread/api/state', null, routeS, 'Bearer stale-sess');
+    const sToken = JSON.parse(fs.readFileSync(path.join(tmp, 'state-sess-sync', 'endpoint.json'), 'utf8')).token;
+    const sAuth = `Bearer ${sToken}`;
+    let rs = await call('POST', '/weread/api/open-reader', { url: 'https://weread.qq.com/web/reader/sync1' }, routeS, sAuth);
     ok(rs.payload.ok === true, '开窗成功（会话互通链路）');
     await new Promise((r2) => setTimeout(r2, 80)); // onWindowSession 异步采纳
-    rs = await call('GET', '/weread/api/state', undefined, routeS);
+    rs = await call('GET', '/weread/api/state', undefined, routeS, sAuth);
     ok(rs.payload.loggedIn === true, '窗内有效会话反向同步：插件登录态点亮（登录弹窗芯片随之转绿）');
     const winCalls = seen.filter((s) => s === 'S_WIN').length;
     ok(winCalls >= 1, `宿主对窗内会话做了服务端裁决（S_WIN × ${winCalls}）`);
-    await call('POST', '/weread/api/open-reader', { url: 'https://weread.qq.com/web/reader/sync1' }, routeS);
+    await call('POST', '/weread/api/open-reader', { url: 'https://weread.qq.com/web/reader/sync1' }, routeS, sAuth);
     await new Promise((r2) => setTimeout(r2, 80));
     // v1.9.0 B1 新语义：同源会话开书做一次同值裁决（10min 缓存首次 miss）——不再断言零往返
     const same1 = seen.filter((s) => s === 'S_WIN').length;
     ok(same1 <= winCalls + 1, `v1.9.0 B1 同源裁决：采纳后开书最多补 1 次同值核验（+${same1 - winCalls}）`);
-    await call('POST', '/weread/api/open-reader', { url: 'https://weread.qq.com/web/reader/sync1' }, routeS);
+    await call('POST', '/weread/api/open-reader', { url: 'https://weread.qq.com/web/reader/sync1' }, routeS, sAuth);
     await new Promise((r2) => setTimeout(r2, 80));
     ok(seen.filter((s) => s === 'S_WIN').length === same1, 'v1.9.0 B1 同源裁决 10min 缓存：后续开书零服务端往返');
     // v1.9.0 C1：开书预热——带凭据开书触发一次 HEAD 续命；30min 门内再开不重复
     ok(seen.filter((s) => s === 'HEAD').length === 1, 'v1.9.0 C1：带凭据开书触发预热 HEAD 恰好一次（首开无凭据不预热、30min 门生效）');
     // v1.9.0 B2：stateView 暴露 Cookie 来源（本轮来自窗内采纳）
-    rs = await call('GET', '/weread/api/state', undefined, routeS);
+    rs = await call('GET', '/weread/api/state', undefined, routeS, sAuth);
     ok(rs.payload.loginChannels?.cookie?.origin?.source === 'window', 'v1.9.0 B2：state 暴露 cookie 来源=window（设置页「上次续命 · 来源」）');
 
     // 账号/凭据保护：插件自身凭据有效时，窗内另一会话不打扰（不覆盖数据通道）
-    rs = await call('POST', '/weread/api/login/cookie', { wrVid: 'V1', wrSkey: 'S_KEY' }, routeS);
+    rs = await call('POST', '/weread/api/login/cookie', { wrVid: 'V1', wrSkey: 'S_KEY' }, routeS, sAuth);
     ok(rs.payload.ok === true, 'Cookie 通道登录成功（S_KEY，fetch 桩有效）');
-    rs = await call('GET', '/weread/api/state', undefined, routeS);
+    rs = await call('GET', '/weread/api/state', undefined, routeS, sAuth);
     ok(rs.payload.loginChannels?.cookie?.origin?.source === 'login', 'v1.9.0 B2：Cookie 登录后来源翻转为 login');
-    await call('POST', '/weread/api/open-reader', { url: 'https://weread.qq.com/web/reader/sync1' }, routeS); // 窗内 S_WIN
+    await call('POST', '/weread/api/open-reader', { url: 'https://weread.qq.com/web/reader/sync1' }, routeS, sAuth); // 窗内 S_WIN
     await new Promise((r2) => setTimeout(r2, 80));
     ok(seen.filter((s) => s === 'S_KEY').length >= 1, '插件自身凭据被服务端复核（有效 → 不采纳窗内会话）');
     const keyCalls = seen.filter((s) => s === 'S_KEY').length;
-    await call('POST', '/weread/api/open-reader', { url: 'https://weread.qq.com/web/reader/sync1' }, routeS);
+    await call('POST', '/weread/api/open-reader', { url: 'https://weread.qq.com/web/reader/sync1' }, routeS, sAuth);
     await new Promise((r2) => setTimeout(r2, 80));
     // v1.9.2 #1（对抗审查）：确定性拒绝加 1h 冷却——同指纹上报不再重复 mineOk 探测。
     // 原断言「每次开窗都重新复核」正是审查点名的问题：回流守护每 10min 重报同指纹 = 日增上百次裸接口探测。
@@ -2304,14 +2336,14 @@ ok(r.payload.gateway && r.payload.gateway.enabled === false && r.payload.gateway
 
     // v1.9.1 修复①：同步进度参数错位——onProgress 第 4 参才是进度对象（原把第 1 参阶段字符串存进
     // syncProgress → stateView 恒字符串 → 书架「X/N 本」从未显示过）。跑一轮真实 /api/sync 验证对象形状。
-    rs = await call('POST', '/weread/api/output-path/validate', { path: path.join(tmp, 'out-progress') }, routeS);
+    rs = await call('POST', '/weread/api/output-path/validate', { path: path.join(tmp, 'out-progress') }, routeS, sAuth);
     ok(rs.payload?.ok === true, '进度链路前置：输出目录已配置');
-    rs = await call('POST', '/weread/api/sync', undefined, routeS);
+    rs = await call('POST', '/weread/api/sync', undefined, routeS, sAuth);
     ok(rs.payload?.started === true, '手动同步异步启动（started:true）');
     let syncSettled = null;
     for (let i = 0; i < 30 && !syncSettled; i++) {
       await new Promise((r2) => setTimeout(r2, 60));
-      const s3 = await call('GET', '/weread/api/state', undefined, routeS);
+      const s3 = await call('GET', '/weread/api/state', undefined, routeS, sAuth);
       if (s3.payload.syncState?.status && s3.payload.syncState.status !== 'syncing') syncSettled = s3.payload;
     }
     ok(!!syncSettled, '同步到达终态');
@@ -2327,14 +2359,14 @@ ok(r.payload.gateway && r.payload.gateway.enabled === false && r.payload.gateway
     // v1.9.2 #2（对抗审查）：第二轮同步 started 即清上一轮 Completed 旧帧——
     // 原保留旧帧时，第二次点同步首秒显示「100% 3/3 · 同步完成」约 1s 才被新帧覆盖。
     // 桩世界 fullSync 毫秒级推进，GET 时可能已有新帧——断言语义为「绝非上一轮的 completed 帧」
-    rs = await call('POST', '/weread/api/sync', undefined, routeS);
+    rs = await call('POST', '/weread/api/sync', undefined, routeS, sAuth);
     ok(rs.payload?.started === true, '第二轮同步启动');
-    const rs2 = await call('GET', '/weread/api/state', undefined, routeS);
+    const rs2 = await call('GET', '/weread/api/state', undefined, routeS, sAuth);
     const sp2 = rs2.payload.syncProgress;
     ok(sp2 === null || sp2.currentStep !== 'completed', '#2：started 即清旧帧——第二轮同步首秒不再闪上一轮「100% N/N」');
     for (let i = 0; i < 30; i++) { // 等第二轮到达终态，避免影响后续断言
       await new Promise((r2) => setTimeout(r2, 60));
-      const s4 = await call('GET', '/weread/api/state', undefined, routeS);
+      const s4 = await call('GET', '/weread/api/state', undefined, routeS, sAuth);
       if (s4.payload.syncState?.status && s4.payload.syncState.status !== 'syncing') break;
     }
 
@@ -2345,10 +2377,10 @@ ok(r.payload.gateway && r.payload.gateway.enabled === false && r.payload.gateway
       `增量修复：计数未变的书不再拉笔记（第二轮 bookmarklist × ${round2NoteFetches}，修复前 ≈ 每本一次）`);
     // v1.9.3 增量：第三轮（PB1 划线 1→2）——只有 PB1 精确拉取
     shelfPB1Notes = 2;
-    await call('POST', '/weread/api/sync', undefined, routeS);
+    await call('POST', '/weread/api/sync', undefined, routeS, sAuth);
     for (let i = 0; i < 30; i++) {
       await new Promise((r2) => setTimeout(r2, 60));
-      const s5 = await call('GET', '/weread/api/state', undefined, routeS);
+      const s5 = await call('GET', '/weread/api/state', undefined, routeS, sAuth);
       if (s5.payload.syncState?.status && s5.payload.syncState.status !== 'syncing') break;
     }
     const round3 = noteFetches.slice(round1NoteFetches + round2NoteFetches);
@@ -2363,10 +2395,10 @@ ok(r.payload.gateway && r.payload.gateway.enabled === false && r.payload.gateway
       delete stData.noteSyncMarks;
       fs.writeFileSync(stFile, JSON.stringify(stData));
     } catch { /* ignore */ }
-    await call('POST', '/weread/api/sync', undefined, routeS);
+    await call('POST', '/weread/api/sync', undefined, routeS, sAuth);
     for (let i = 0; i < 30; i++) {
       await new Promise((r2) => setTimeout(r2, 60));
-      const s6 = await call('GET', '/weread/api/state', undefined, routeS);
+      const s6 = await call('GET', '/weread/api/state', undefined, routeS, sAuth);
       if (s6.payload.syncState?.status && s6.payload.syncState.status !== 'syncing') break;
     }
     const round4 = noteFetches.slice(round1NoteFetches + round2NoteFetches + round3.length);
@@ -2375,21 +2407,21 @@ ok(r.payload.gateway && r.payload.gateway.enabled === false && r.payload.gateway
 
     // v1.9.5：cancel 路由登录态冒烟——修复 acc 未定义（原只在未登录 401 路径测过，
     // 登录态点取消必抛 ReferenceError「acc is not defined」，真机反馈）
-    rs = await call('POST', '/weread/api/sync/cancel', undefined, routeS);
+    rs = await call('POST', '/weread/api/sync/cancel', undefined, routeS, sAuth);
     ok(rs.status === 200 && rs.payload?.ok === true && rs.payload?.cancelling === false,
       'v1.9.5：登录态取消端点可用（无同步在跑 → cancelling:false，不再 acc is not defined）');
 
     // v1.9.1 修复②：verify 核验结论回写 loginState——弹层「有效」而横幅仍「登录已过期」的状态分裂
     validSet.delete('S_KEY'); shelfOn = false; // 服务端判死 S_KEY（书架+裸接口双跳全判死）
     worldS.targets = []; worldS.alive = false; // 关窗：隔离「窗内救活」路径，纯测修正分支
-    rs = await call('POST', '/weread/api/login/verify', undefined, routeS);
+    rs = await call('POST', '/weread/api/login/verify', undefined, routeS, sAuth);
     ok(rs.payload?.ok === false, 'verify：凭据判死 → ok:false');
-    rs = await call('GET', '/weread/api/state', undefined, routeS);
+    rs = await call('GET', '/weread/api/state', undefined, routeS, sAuth);
     ok(rs.payload.loggedIn === false && rs.payload.loginExpired === true, 'v1.9.1：核验失败回写 loginState（横幅如实显示过期）');
     validSet.add('S_KEY'); shelfOn = true; // 凭据恢复（如续命/救活后）
-    rs = await call('POST', '/weread/api/login/verify', undefined, routeS);
+    rs = await call('POST', '/weread/api/login/verify', undefined, routeS, sAuth);
     ok(rs.payload?.ok === true, 'verify：凭据恢复 → ok:true');
-    rs = await call('GET', '/weread/api/state', undefined, routeS);
+    rs = await call('GET', '/weread/api/state', undefined, routeS, sAuth);
     ok(rs.payload.loggedIn === true && rs.payload.loginExpired === false,
       'v1.9.1：核验成功撤销过期状态——弹层全绿时横幅不再僵死在「登录已过期」（真机反馈修复）');
     disposeS();
@@ -2442,7 +2474,7 @@ ok(r.payload.gateway && r.payload.gateway.enabled === false && r.payload.gateway
     return origFetchR(input, init);
   };
   try {
-    const disposeR = apply(ctxR, { stateDir: dirR, outputPath: '', readerDeps: depsR, getAccountId: () => '' });
+    const disposeR = apply(ctxR, { stateDir: dirR, outputPath: '', apiToken: SMOKE_TOKEN, readerDeps: depsR, getAccountId: () => '' });
     const routeR = regR.web.find((x) => x.path === '/weread');
     await new Promise((r2) => setTimeout(r2, 400)); // 启动 classify → C2 救活链（异步）
     const rs = await call('GET', '/weread/api/state', undefined, routeR);
@@ -2623,7 +2655,7 @@ ok(r.payload.gateway && r.payload.gateway.enabled === false && r.payload.gateway
       timeouts: { tier1: 20, tier2: 20, ready: 20, boundsWatch: 60_000, injectWatch: 40, jamWatch: 60_000 },
     };
     fs.writeFileSync(path.join(outDir, 'zz-ask-book.md'), '---\ntitle: 问询书\nbookid: AKBOOK1\n---\n## 读书笔记\n\n### 第一章\n\n🖍️ 划线\n> 问询书的划线内容\n\n_记录时间：2026-11-08 10:00:00_\n');
-    const disposeAK = apply(ctxAK, { stateDir: path.join(tmp, 'state-ask'), outputPath: outDir, readerDeps: depsA });
+    const disposeAK = apply(ctxAK, { stateDir: path.join(tmp, 'state-ask'), outputPath: outDir, apiToken: SMOKE_TOKEN, readerDeps: depsA });
     const routeAK = regAK.web.find((x) => x.path === '/weread');
     const rs = await call('POST', '/weread/api/open-reader', { url: 'https://weread.qq.com/web/reader/ak1' }, routeAK);
     ok(rs.payload.ok === true, '开窗（ask apply 世界）');
@@ -2649,7 +2681,7 @@ r = await call('POST', '/weread/api/config', { keychain: false });
 dispose3();
 const reg4 = { web: [], tools: [] };
 const ctx4 = { effect: (fn) => { fn(); return () => {}; }, webServer: { register: (x) => reg4.web.push(x) }, tools: { register: (x) => reg4.tools.push(x) } };
-const dispose4 = apply(ctx4, { stateDir: path.join(tmp, 'state'), outputPath: '' });
+const dispose4 = apply(ctx4, { stateDir: path.join(tmp, 'state'), outputPath: '', apiToken: SMOKE_TOKEN });
 route = reg4.web.find((x) => x.path === '/weread');
 r = await call('POST', '/weread/api/uninstall/cleanup');
 ok(r.status === 400, '卸载清理缺 confirm 确认参数被拒（P1-5）');
