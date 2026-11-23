@@ -53,7 +53,7 @@
 这个插件的核心价值主张：**笔记同步只是手段，让 AI 用上你的阅读资产才是目的**。
 
 - **阅读上下文注入**：每次模型请求自动附带「用户近期阅读」动态 context（近 5 本书 + 最新划线，10 分钟缓存）。你不用贴任何内容，直接问「这本书里作者怎么看 X」「从我最近的划线里找写作素材」——AI 天然带着你的阅读现场。
-- **Agent 工具 `weread`**：DSH 会话内模型可直接调用 `sync / status / books / search / notes / insights / roaming`，工具调用渲染为卡片。说「同步一下微信读书，然后搜『认知负荷』的划线」，模型自己组合两步。
+- **Agent 工具 `weread`**：DSH 会话内模型可直接调用 11 个动作——`sync / status / books / search / notes / insights / roaming / ask / stats / store / recommend`；其中 `ask` 基于本地笔记检索作答（带编号出处、不编造材料之外的内容），`stats / store / recommend` 走官方网关（需绑定 API Key）；`books / search / notes / insights / roaming` 的结果渲染为可点卡片。说「同步一下微信读书，然后搜『认知负荷』的划线」，模型自己组合两步。
 - **MCP server（跨宿主）**：`tools/mcp-server.mjs` 把插件 API 包装为 9 个标准 MCP 工具（5 只读 + 4 写路径），Claude / Cursor / 其他 MCP 宿主开箱即用，端点自动发现——不装 DSH 也能让别的 AI 用这份数据。
 - **@选书 触发器**：输入 `@微信读书` 前缀即出书籍候选（DSH input trigger），把书递给 AI 不用离开输入框。
 - **漫游小卡 × 写作流**：输入框下方常驻随机划线，配合写作场景「换一张→让 AI 展开」，形成取材-扩写的小循环。
@@ -64,7 +64,7 @@
 | DSH / AI 能力 | 插件用法 |
 | --- | --- |
 | Context 注入（动态上下文） | 近期阅读 + 最新划线自动进每轮请求 |
-| Agent 工具（function calling） | `weread` 7 动作，同步/检索/洞察全在会话内 |
+| Agent 工具（function calling） | `weread` 11 动作，同步/检索/问答/洞察/书城全在会话内 |
 | MCP 协议 | 9 工具包装，跨 Claude/Cursor 等宿主复用 |
 | Input trigger | `@微信读书` 书籍候选直递输入框 |
 | UI slots 注入 | 侧栏面板 / KPI 胶囊 / 漫游小卡三处原生入口 |
@@ -83,17 +83,21 @@
 - 漫游导图由浏览器 Canvas 生成后直接下载 PNG；洞察月报写入 `输出目录/阅读洞察报告/`。
 - macOS 隐私设置深链未保留，权限错误以文案提示。
 
-## 安装（四选一）
+## 安装（五选一）
 
-**方式一：插件市场（推荐）** —— 在 DSH 的 **插件 → 发现 → 添加索引源** 粘贴本仓库自托管索引：
+**方式一：开放插件市场（推荐）** —— 先把开放插件市场添加为索引源（只需一次）：DSH **插件 → 实验性插件 → 自定义插件市场**，在 **发现 → 添加索引源** 粘贴：
 
 ```
-https://raw.githubusercontent.com/wangjianghu/weread-dsh/main/market/index.json
+https://dshopen.org/index.json
 ```
 
-之后在发现页找到「微信读书笔记（weread-dsh）」点安装。（需先启用实验性 **Custom plugin indexes** bundle）
+之后在「发现」里搜 `weread-dsh` 安装。（需先启用实验性 **Custom plugin indexes** bundle）更省事的是装开放市场插件，之后在「插件 → 开放市场」标签里搜索安装，有新版本可一键更新：
 
-**Install via market (recommended)** — DSH **Plugins → Discover → Add index source**, paste the self-hosted index URL above, then install *WeRead Notes (weread-dsh)* from the Discover list.
+```bash
+dsh plugin --profile desktop add dsh-open-market
+```
+
+**Install via Open Plugin Market (recommended)** — add the market as an index source once: **Plugins → Experimental → Custom plugin markets → Discover → Add index source** with the URL above, then search `weread-dsh` in Discover. Or install the `dsh-open-market` plugin (command above) and install from its Open Market tab, with one-click updates.
 
 **方式二：npm 安装**
 
@@ -111,7 +115,17 @@ dsh plugin --profile desktop add "git+https://github.com/wangjianghu/weread-dsh.
 
 **Install pinned to a tag** — the command above pins the exact v1.9.13 release tag.
 
-**方式四：本地目录安装** —— DSH 插件页 **Add plugin** 选择本仓库目录（开发模式）。
+**方式四：自托管索引源（本仓库）** —— 在 DSH 的 **插件 → 发现 → 添加索引源** 粘贴本仓库自托管索引：
+
+```
+https://raw.githubusercontent.com/wangjianghu/weread-dsh/main/market/index.json
+```
+
+之后在发现页找到「微信读书笔记（weread-dsh）」点安装。（需先启用实验性 **Custom plugin indexes** bundle）
+
+**Install via the self-hosted index** — DSH **Plugins → Discover → Add index source**, paste the self-hosted index URL above, then install *WeRead Notes (weread-dsh)* from the Discover list.
+
+**方式五：本地目录安装** —— DSH 插件页 **Add plugin** 选择本仓库目录（开发模式）。
 
 **Install from a local directory** — **Plugins → Add plugin** with this repository directory (development mode).
 
@@ -120,7 +134,7 @@ dsh plugin --profile desktop add "git+https://github.com/wangjianghu/weread-dsh.
 1. DSH 安装本 bundle，侧栏点「微信读书」。
 2. 设置 tab 配置笔记存储路径（绝对路径，自动校验）。
 3. 登录（三选一：扫码 / 粘贴 wr_vid+wr_skey / 官方 API Key）→ 同步。
-4. Agent 可用 `weread` 工具：sync / status / books / search / insights / roaming。
+4. Agent 可用 `weread` 工具：sync / status / books / search / notes / insights / roaming / ask / stats / store / recommend。
 
 ## 官方 API Key 通道（v1.1）
 
@@ -129,7 +143,8 @@ dsh plugin --profile desktop add "git+https://github.com/wangjianghu/weread-dsh.
 - **已登录（扫码/Cookie）时绑定当前账号**（推荐）：不动账号目录与多账号模型；cookie 失效但 Key 有效时不误登出（Key 营救）。
 - **未登录时独立登录**：官方网关暂无身份回显接口，账号 ID 由 notebooks 签名哈希生成（确定性）。
 - Key 在场时自动启用：**想法/书评补采**（整本书评、章节点评进 Markdown——此前只有划线）、**同步对账**（服务端三计数 vs 本地导出条数，差异即提示可能漏采）、设置页「官方通道」卡片的连通性测试与解绑。
-- 同步主管线（书架/划线）v1.1 仍走 cookie 通道；网关回包字段是否满足导出全字段以真机 `连通性测试`+`对账` 双信号验证后再切换（roadmap §8A 闸门）。
+- 绑定后另解锁：「发现」页签（书城搜索 / 为你推荐）、官方阅读统计、精确阅读进度与热门划线；未绑定时「发现」页签不显示。
+- 同步数据源：绑定 Key 后划线走官方网关优先（`/book/bookmarklist`），失败回落 Cookie 通道；未绑定时走 Cookie 通道。
 
 ## DSH 深度集成
 
@@ -159,7 +174,7 @@ DSH 插件 = **一个 cordis bundle**（`package.json` 的 `dsh` 字段声明）
 curl -s http://127.0.0.1:<port>/weread/api/notes/search?q=认知 | jq '.items[0]'
 ```
 
-Agent 工具 `weread` 动作：`sync / status / books / search / notes / insights / roaming`。
+Agent 工具 `weread` 动作（11 个）：`sync / status / books / search / notes / insights / roaming / ask / stats / store / recommend`。
 
 ### MCP server（其他 Agent 宿主接入）
 
