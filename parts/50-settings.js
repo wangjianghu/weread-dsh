@@ -23,6 +23,11 @@ W.CSS_50 = `
    - 任意上下文：max-width:100% + width:auto → 不会溢出卡片 */
 .wr-card{display:block!important}
 .wr-set-card>*{flex-basis:100%!important;grid-column:1/-1!important;max-width:100%!important;width:auto!important;box-sizing:border-box}
+/* v1.9.22：保存条靠负外边距铺到卡片两边缘（下方 .wr-save-bar 的左右 margin -16px）——豁免上面的 max-width 卡宽。
+   否则负外边距只在左侧生效：底条右缩 16px，按钮又因底条内边距再缩 16px，比右侧开关共左缩 32px
+   （真机截图 + tools/layout-repro.mjs --assert 复现：按钮右缘 877 / 开关右缘 909）。
+   flex 上下文（上面防的宿主横向排版）里基准同步放宽同样的 32px，底条仍恰好占满一行。 */
+.wr-set-card>.wr-save-bar{max-width:none!important;flex-basis:calc(100% + 32px)!important}
 @container (min-width: 700px){
   .wr-set-form-cols{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:28px}
 }
@@ -182,6 +187,9 @@ W.CSS_50 = `
     const [logBusy, setLogBusy] = useState(false);
     // v1.1 官方通道（API Key）
     const [gwTest, setGwTest] = useState(null);
+    // v1.9.19 官方 Skill 一键升级：进行中 / 结果提示
+    const [skillBusy, setSkillBusy] = useState(false);
+    const [skillMsg, setSkillMsg] = useState(null);
     const [gwBusy, setGwBusy] = useState(false);
     // v1.5 单例阅读窗口（自检/关闭）
     const [rwDiag, setRwDiag] = useState(null);
@@ -228,6 +236,26 @@ W.CSS_50 = `
         setLastValidation(s.validation || null);
       } catch { /* 忽略 */ }
     }, []);
+    // v1.9.19：一键升级官方 Skill。宿主负责下载/读版本/切换/验证/回滚；这里只发请求并呈现结果。
+    // 成功后刷新 state——版本标签与升级提示都随 state 更新（提示在「最新版 ≤ 当前」时由宿主判定为无）。
+    const doSkillUpgrade = async () => {
+      if (skillBusy) return;
+      setSkillBusy(true); setSkillMsg(null);
+      try {
+        const r = await W.post('/api/gateway/skill-upgrade', {});
+        const text = r.changed ? W.t.skillUpgraded(r.to) : W.t.skillAlreadyLatest(r.version);
+        setSkillMsg({ ok: true, text });
+        if (r.changed) onToast && onToast(text);
+        setGwTest(null); // 版本变了，旧的连通性测试结果不再对应
+        await refreshState();
+      } catch (e) {
+        // v1.9.20：界面（client）会热更新，宿主进程不会——宿主还是旧版时没有升级路由，回 404「no route」。
+        // 这种情况直说「重启 DSH」，不把路由路径甩给用户。
+        const staleHost = e.status === 404 || /^no route:/.test(String(e?.message ?? ''));
+        setSkillMsg({ ok: false, text: staleHost ? W.t.skillUpgradeStaleHost : W.t.skillUpgradeFailed(e.message || String(e)) });
+      }
+      setSkillBusy(false);
+    };
 
     // C7：state 由 App 轮询/传入，挂载不再重复拉取；保存后经 refreshState prop 刷新
 
@@ -381,6 +409,20 @@ W.CSS_50 = `
         setLogLines([]);
         onToast && onToast(W.t.logsCleared);
       } catch (e) { onToast && onToast(e.message || W.t.clearFailed); }
+    };
+    // v1.9.17：一键复制当前通道**已加载**的日志（排障时贴给 AI/issue 用）。
+    // 复制的是界面上已显示的内容（logLines），不另发请求——所见即所得；未加载/为空时按钮禁用。
+    // 首行带通道名与插件版本，便于他人在上下文里定位（日志行本身含 ISO 时间戳）。
+    const logsCopyable = Array.isArray(logLines) && logLines.length > 0;
+    const copyLogs = async () => {
+      if (!logsCopyable) return;
+      const head = `# weread-dsh v${W.VERSION || '?'} · 日志通道: ${logChannel} · ${logLines.length} 行 · 复制于 ${new Date().toISOString()}`;
+      const text = [head, ...logLines].join('\n');
+      try {
+        if (!navigator.clipboard || typeof navigator.clipboard.writeText !== 'function') throw new Error('clipboard unavailable');
+        await navigator.clipboard.writeText(text);
+        onToast && onToast(W.t.logsCopied(logLines.length));
+      } catch (e) { onToast && onToast(W.t.logsCopyFailed); }
     };
 
     const accounts = st?.accounts || [];
@@ -594,8 +636,15 @@ W.CSS_50 = `
               gwTest.ok
                 ? W.t.gatewayTestOk(gwTest.latencyMs ?? '?', gwTest.apiCount || 0)
                 : `✗ ${gwTest.error || W.t.failedWord}`),
-            st?.gateway?.upgrade?.info && h('div', { className: 'wr-summary', style: { color: 'var(--dsw-alias-warning, #d29922)' } },
-              W.t.skillVersionTip(JSON.stringify(st.gateway.upgrade.info).slice(0, 160))),
+            // v1.9.19：把原来的「原始 JSON 提示」换成一行人话 + 升级按钮（宿主只在「最新版 > 当前」时才给 upgrade）
+            st?.gateway?.upgrade?.info && h('div', { className: 'wr-summary', style: { color: 'var(--dsw-alias-warning, #d29922)', display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8 } },
+              h('span', null, W.t.skillUpgradeAvailable(st.gateway.skillVersion, String(st.gateway.upgrade.info.latest_version || '').replace(/^v/, '') || '?')),
+              h('button', { className: 'wr-btn', disabled: skillBusy, title: W.t.skillUpgradeTip, onClick: doSkillUpgrade },
+                skillBusy ? W.t.skillUpgrading : W.t.skillUpgradeBtn)),
+            skillMsg && h('div', { className: 'wr-summary', style: { color: skillMsg.ok ? 'var(--dsw-alias-success, #3fb950)' : 'var(--dsw-alias-danger, #e5484d)' } },
+              (skillMsg.ok ? '✓ ' : '✗ ') + skillMsg.text),
+            st?.gateway?.skillVersionOverridden && h('div', { className: 'wr-muted wr-small' },
+              W.t.skillUpgradedNote(st.gateway.skillVersion, st.gateway.bundledSkillVersion)),
             st?.syncState?.reconcile && h('div', { className: 'wr-set-row', style: { marginTop: 4 } },
               // 标签默认固定 110px，长内容会溢出与右侧状态文字叠印——本行放开宽度并整段不折行，行内放不下则整段换行
               h('span', { className: 'wr-set-label', style: { width: 'auto', flex: '0 1 auto', whiteSpace: 'nowrap' } }, W.t.gatewayReconcile,
@@ -604,7 +653,8 @@ W.CSS_50 = `
                 className: 'wr-small',
                 style: { color: st.syncState.reconcile.mismatchedCount > 0 ? 'var(--dsw-alias-warning, #d29922)' : 'var(--dsw-alias-success, #3fb950)' },
               }, st.syncState.reconcile.mismatchedCount > 0
-                ? W.t.gatewayReconcileBad(st.syncState.reconcile.checkedBooks, st.syncState.reconcile.mismatchedCount)
+                // v1.9.20：把整份对账结果交给文案——按「本地多于 / 少于服务端」说不同的话（全是重复时不该再提「漏采」）
+                ? W.t.gatewayReconcileBad(st.syncState.reconcile.checkedBooks, st.syncState.reconcile.mismatchedCount, st.syncState.reconcile)
                 : W.t.gatewayReconcileOk(st.syncState.reconcile.checkedBooks))),
             st?.syncState?.reconcile?.mismatchedCount > 0 && h('div', { className: 'wr-summary' },
               st.syncState.reconcile.mismatched.slice(0, 5).map((m) => W.t.reconcileRow(m.title, m.local, m.expected)).join('\n'),
@@ -657,6 +707,12 @@ W.CSS_50 = `
                 onChange: (e) => setLogChannel(e.target.value) },
                 ['op', 'roaming', 'dedupe', 'cleanup'].map((c) => h('option', { key: c, value: c }, c))),
               h('button', { className: 'wr-btn', disabled: logBusy, onClick: () => loadLogs(logChannel) }, W.t.refresh),
+              // v1.9.17：复制已加载的日志（图标按钮；未加载/为空时禁用）
+              h('button', {
+                className: 'wr-btn', disabled: !logsCopyable, onClick: copyLogs,
+                title: logsCopyable ? W.t.logsCopyTip : W.t.noData, 'aria-label': W.t.logsCopyTip,
+                style: { display: 'inline-flex', alignItems: 'center', gap: '4px' } },
+                W.I.copy(12), W.t.copy),
               h('button', { className: 'wr-btn', onClick: clearLogs }, W.t.clearAll)),
             h('div', { className: 'wr-logbox' },
               logLines == null ? W.t.loading

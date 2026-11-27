@@ -4,7 +4,7 @@
 
 微信读书 DSH 插件（由 [weread-vscode 0.1.2](https://github.com/wangjianghu/VSCode-WeRead) VSIX 改造，MIT）。
 
-功能：微信读书笔记同步、Markdown 导出、笔记搜索、阅读洞察、笔记漫游、多账号管理、官方 API Key 通道（v1.1）。
+功能：微信读书笔记同步、Markdown 导出、笔记搜索、阅读洞察、笔记漫游、多账号管理、官方 API Key 通道（v1.1）、「发现」页（书城搜索 / 为你推荐 / 官方阅读统计）、阅读窗口内「问 DSH」。
 
 **它不只是「导出笔记」**：笔记落到本地 Markdown 后，插件通过 DSH 的插件机制把它们接进 AI 对话——模型每轮自动知道你在读什么，会话内可直接指挥同步/搜索/洞察，其他 Agent 宿主可经 MCP 复用同一份数据。见下文「AI 与 Agent 集成」「DSH 深度集成」。
 
@@ -47,6 +47,8 @@
 - 悬浮阅读入口：点书直接开独立单例阅读窗口（CDP 单例复用，多账号端口分区互不劫持）
 - 侧栏 KPI 胶囊（近 30 天活跃天数/笔记数）、输入框下方漫游小卡（随机划线取材）
 - 三通道登录：协议扫码 / 粘贴 Cookie / 官方 API Key；凭据镜像 macOS Keychain，文件 0600
+- 阅读窗口内「问 DSH」：在书页里划选文字直接提问，消息自动带上这本书的本地笔记；这本书没同步过就先即时同步再问
+- 登录态自愈：阅读窗口与登录弹窗的会话实时回流；窗口没开时后台静默续期，Cookie 过期有明确提示
 
 ## AI 与 Agent 集成
 
@@ -58,6 +60,7 @@
 - **@选书 触发器**：输入 `@微信读书` 前缀即出书籍候选（DSH input trigger），把书递给 AI 不用离开输入框。
 - **漫游小卡 × 写作流**：输入框下方常驻随机划线，配合写作场景「换一张→让 AI 展开」，形成取材-扩写的小循环。
 - **官方 API Key 通道**：`wrk-` Key 绑定账号后启用官方网关，解锁想法/书评补采与同步对账（见下文专节）。
+- **「问 DSH」带着笔记提问**：阅读窗口里选中即问时，按页面 URL 里的书 ID 精确匹配本地笔记库（取不到再按书名），默认把这本书的近期划线附进消息；本地没有这本书就即时同步进来（与全量同步同口径：没有任何划线/想法的书不导入）。
 
 ### 与 DSH / AI 能力的结合矩阵
 
@@ -107,13 +110,13 @@ dsh plugin --profile desktop add weread-dsh
 
 **Install from npm** — published as [`weread-dsh`](https://www.npmjs.com/package/weread-dsh); replace the profile name as needed.
 
-**方式三：直装（pin 到 v1.9.13 对应 tag）**
+**方式三：直装（pin 到 v1.9.23 对应 tag）**
 
 ```bash
-dsh plugin --profile desktop add "git+https://github.com/wangjianghu/weread-dsh.git#v1.9.13"
+dsh plugin --profile desktop add "git+https://github.com/wangjianghu/weread-dsh.git#v1.9.23"
 ```
 
-**Install pinned to a tag** — the command above pins the exact v1.9.13 release tag.
+**Install pinned to a tag** — the command above pins the exact v1.9.23 release tag.
 
 **方式四：自托管索引源（本仓库）** —— 在 DSH 的 **插件 → 发现 → 添加索引源** 粘贴本仓库自托管索引：
 
@@ -145,6 +148,7 @@ https://raw.githubusercontent.com/wangjianghu/weread-dsh/main/market/index.json
 - Key 在场时自动启用：**想法/书评补采**（整本书评、章节点评进 Markdown——此前只有划线）、**同步对账**（服务端三计数 vs 本地导出条数，差异即提示可能漏采）、设置页「官方通道」卡片的连通性测试与解绑。
 - 绑定后另解锁：「发现」页签（书城搜索 / 为你推荐）、官方阅读统计、精确阅读进度与热门划线；未绑定时「发现」页签不显示。
 - 同步数据源：绑定 Key 后划线走官方网关优先（`/book/bookmarklist`），失败回落 Cookie 通道；未绑定时走 Cookie 通道。
+- **官方 Skill 一键升级（v1.9.19）**：微信读书官方发布新版接口说明后，设置页显示一行提示，点「升级 Skill」即可——从官方 CDN 下载说明包、只读出其中的版本号、切换后续请求携带的 `skill_version`，并用新版本号做一次连通性验证，失败自动回滚。插件内置的版本自 v1.9.21 起为 1.0.6。
 
 ## DSH 深度集成
 
@@ -165,6 +169,14 @@ DSH 插件 = **一个 cordis bundle**（`package.json` 的 `dsh` 字段声明）
 - **Client 半**（`client.js`，由 `parts/*.js` 构建）：经宿主 `window.__ModuleLoader__.load` 装载，`ctx.slots.inject('sidebar.panellist' | 'main' | ...)` 注册侧栏图标与主面板；样式全走 `--dsw-alias-*` 主题令牌，明暗色自动适配。
 - **上下文**：注册 context provider，把「近期阅读」注入每轮模型请求（这是 AI 结合的最短路径）。
 - **安装形态**：本地开发用 profile 依赖 `link:` 直连源码目录；分发包以 bundle 名（如 `@local/dsh-weread`）注册进 `dsh.profile.bundles`。
+
+## 最近更新 / What's new（v1.9.14 → v1.9.23）
+
+- **笔记翻倍修复（v1.9.20）**：锚点功能上线前建好的笔记库，每条笔记会被存成两份（本地条数 = 2×服务端）；下一轮同步自动清理，对账提示区分「本地偏多」与「可能漏采」。 / **Duplicated-notes fix (v1.9.20)**: libraries created before note anchors stored every note twice (local = 2× server); the next sync cleans them up, and the reconcile hint now tells "local higher" from "possibly missing".
+- **「问 DSH」按书 ID 命中 + 即时同步（v1.9.19）**：见上文「AI 与 Agent 集成」。 / **Ask DSH matches by book ID and imports on demand (v1.9.19)**: see "AI 与 Agent 集成" above.
+- **官方 Skill 一键升级（v1.9.19 / v1.9.21）**：见上文「官方 API Key 通道」。 / **One-click official Skill upgrade (v1.9.19 / v1.9.21)**: see "官方 API Key 通道" above.
+- **阅读窗口稳定性（v1.9.14–v1.9.18）**：登录态在窗口与弹窗之间实时回流、后台静默续期；重开窗口还原上次的位置大小；日志一键复制、会话快照恢复。 / **Reader-window stability (v1.9.14–v1.9.18)**: login state flows between the window and the login modal in real time, with silent background renewal; a reopened window restores its last geometry; one-click log copy and session-snapshot recovery.
+- **设置页（v1.9.22）**：「保存并应用」按钮贴齐右边缘。 / **Settings (v1.9.22)**: the Save & Apply button is flush with the right edge.
 
 ## 互操作（E）
 
@@ -198,18 +210,24 @@ Claude Code 配置样例（`~/Library/Application Support/Claude/claude_desktop_
 ## 开发与测试
 
 - **client.js 是构建产物**：业务代码在 `parts/*.js`（00-head → 90-tail 顺序拼接）。改 parts 后必须 `npm run build` 重建，**不要直接改 client.js**；`npm run check` 可校验产物与 parts 是否一致。
-- **测试**：`npm install && npm test` 串跑——`build.mjs --check`（parts→client.js 一致性）、`node --test test/`（单元测试 168 例：markdown/store/analytics/zip/sync/api/auth/gateway/wsbus，零新依赖）、`smoke.mjs`（后端 400+ 断言，fake ctx 不触网）、`rmsmoke.mjs`（组件渲染 + 文案/i18n 断言）、`tools/react-mount-test.mjs`（真实 React 挂载 App/dock/侧栏 + @选书形状守卫，防面板空白类回归）、`tools/mcp-server.mjs --selftest`（MCP 全链路含异常路径）。每次改动后必跑。
+- **测试**：`npm install && npm test` 串跑——`build.mjs --check`（parts→client.js 一致性）、`node --test test/`（单元测试 247 例：markdown/store/analytics/zip/sync/api/auth/gateway/wsbus/refresh/skillupgrade/callerauth/authtoken，零新依赖）、`smoke.mjs`（后端 569 断言，fake ctx 不触网）、`rmsmoke.mjs`（组件渲染 + 文案/i18n 断言）、`tools/react-mount-test.mjs`（真实 React 挂载 App/dock/侧栏 + @选书形状守卫，防面板空白类回归）、`tools/mcp-server.mjs --selftest`（MCP 全链路含异常路径）。另有 `tools/layout-repro.mjs --assert`（真实渲染设置页 + 无头 Chrome 量坐标，断言保存条对齐；依赖本机 Chrome，不进 `npm test`）。每次改动后必跑。
 - **版本记录**：见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 发版流程
 
-1. `npm test` 全绿；2. package.json 升版本号；3. CHANGELOG.md 增加该版条目；4. git commit + `git tag v<版本号>`；5. 在 DSH 插件管理页重装 bundle 并刷新面板走查一遍。版本号、CHANGELOG、git tag 三者保持一一对应。
+开发在带完整提交历史的本地仓库进行；对外发布走这个 GitHub 镜像，每次发布四件事一一对应——**版本号、CHANGELOG、git tag、npm 版本**：
+
+1. **先清理再同步**：对将要公开的文件做全量扫描——用户名、绝对路径、真实账号、凭据、真实书名与公众号名，命中即替换成泛指。只同步代码、测试、README、CHANGELOG、LICENSE、CI 与市场索引；分析、设计、审查类文档只留本地。
+2. **每次推送合并为一条提交**：GitHub 上只保留与发布次数对应的提交记录，并打 `v<版本号>` tag、建中英双语 Release；CI（构建一致性 + 全部测试）必须通过。
+3. **`npm publish`**（包名 `weread-dsh`）：市场索引的版本来源都指向它。
+4. **更新收录**：仓库内自托管市场索引 `market/index.json`、dshopen.org、Awesome DSH Plugin（同时是 dsh-market 的目录来源）。
+
+**Release process** — development happens in a local repo with full history; publishing goes through this GitHub mirror. Version, CHANGELOG, git tag and the npm release always match: scan for personal data before syncing anything (code, tests, README, CHANGELOG, LICENSE, CI and the market index only — analysis/design/review docs stay local), squash each push into a single commit with a `v<version>` tag and a bilingual Release, `npm publish` as `weread-dsh`, then refresh the market listings.
 
 ## 安全模型
 
 - **面板加载失败修复（v1.9.12）**：v1.9.11 的认证代码直接读取宿主 `connection` 服务触发框架守卫异常，浏览器面板全量 500；现改为动态注入捕获，桌面/headless 两种宿主形态均正常（163 例单测回归覆盖）。 / **Panel load-failure fix (v1.9.12)**: v1.9.11 auth code read the host `connection` service directly and tripped the framework guard, 500-ing every panel request; now captured via dynamic injection — both desktop and headless hosts work (covered by 163 unit tests).
 - **准入语义修正（v1.9.13，dshopen #522 复审）**：宿主 `admit` 拒绝时返回 `rejection` 对象而非抛异常，现仅在明确准入（`peer`）时放行，杜绝把拒绝误判为通过。 / **Admission semantics fix (v1.9.13, dshopen #522 re-review)**: host `admit` signals denial by returning a `rejection` object, not by throwing; requests now pass only on explicit admission (`peer`), never mistaking denial for success.
-- **面板加载失败修复（v1.9.12）**：v1.9.11 的认证代码直接读取宿主 `connection` 服务触发框架守卫异常，浏览器面板全量 500；现改为动态注入捕获，桌面/headless 两种宿主形态均正常。 / **Panel load-failure fix (v1.9.12)**: v1.9.11 auth code read the host `connection` service directly and tripped the framework guard, 500-ing every panel request; now captured via dynamic injection — both desktop and headless hosts work.
 - **宿主调用方认证（v1.9.11）**：`/weread/*` 全部 HTTP 路由与 WS 升级须持有其一凭据——宿主签名 cookie（`ctx.connection.admit`，DSH 页面同源请求自动携带）或插件自签 Bearer token（随 `endpoint.json` 分发给 MCP 等本地工具，timing-safe 比较）。本机其他进程无法再匿名读取完整 API Key 或私人笔记；宿主无 `connection` 服务（headless 组合）且无 Bearer 时拒绝服务（fail-closed）。
 - 本插件在本机开启仅 loopback（127.0.0.1/localhost/::1，可带端口）的 HTTP/WS 服务；带 Origin 的浏览器请求要求 Origin host 与 Host 一致且为 loopback（防 DNS rebinding），无 Origin 的本地工具凭 loopback Host 放行。
 - 微信读书凭据（cookie / API Key）只存本机 `~/.dsh/weread`（secrets 文件 0600 权限位），不经任何第三方服务；登录二维码本地生成。

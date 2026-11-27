@@ -126,6 +126,26 @@ document.querySelectorAll('.wr-set-card').forEach((card,ci)=>{
 const grid=document.querySelector('.wr-set-grid');
 const gs=grid?getComputedStyle(grid):null;
 const res={gridDisplay:gs&&gs.display, gridCols:gs&&gs.gridTemplateColumns, cards:out};
+// v1.9.22：保存条对齐测量——「保存并应用」按钮右缘、底条两缘、表单控件右缘、卡片内容区两缘。
+// 保存条靠负外边距铺到卡片两边缘；卡片直接子元素的 max-width 卡宽会让负外边距只在左侧生效。
+const fc=document.querySelector('.wr-set-card--form')||document.querySelector('.wr-set-card');
+const sb={};
+if(fc){
+  const fr=fc.getBoundingClientRect(), fs=getComputedStyle(fc);
+  sb.innerLeft=fr.left+parseFloat(fs.borderLeftWidth)+parseFloat(fs.paddingLeft);
+  sb.innerRight=fr.right-parseFloat(fs.borderRightWidth)-parseFloat(fs.paddingRight);
+  const bar=fc.querySelector('.wr-save-bar'), btn=bar&&bar.querySelector('button');
+  const sw=[...fc.querySelectorAll('.wr-switch')].pop(), fld=[...fc.querySelectorAll('.wr-set-field')].pop();
+  if(bar){
+    const br=bar.getBoundingClientRect(), bs=getComputedStyle(bar);
+    sb.barLeft=br.left; sb.barRight=br.right; sb.barMaxWidth=bs.maxWidth;
+    sb.barMarginLeft=parseFloat(bs.marginLeft); sb.barMarginRight=parseFloat(bs.marginRight); sb.barPaddingRight=parseFloat(bs.paddingRight);
+  }
+  if(btn){ const b=btn.getBoundingClientRect(); sb.buttonLeft=b.left; sb.buttonRight=b.right; }
+  if(sw) sb.toggleRight=sw.getBoundingClientRect().right;
+  if(fld) sb.fieldRight=fld.getBoundingClientRect().right;
+}
+res.saveBar=sb;
 document.title='MEASURE_DONE';
 const pre=document.createElement('pre'); pre.id='measure'; pre.textContent=JSON.stringify(res,null,1);
 document.body.appendChild(pre);
@@ -148,4 +168,25 @@ console.log('grid:', res.gridDisplay, '| cols:', res.gridCols);
 for (const c of res.cards) {
   console.log(`\n卡片#${c.card} [${c.cls}] rect=${c.rect.map(Math.round)} "${c.children[0]?.txt}"`);
   for (const ch of c.children) console.log(`   x=${String(ch.x).padStart(4)} y=${String(ch.y).padStart(4)} ${String(ch.w).padStart(3)}x${String(ch.h).padStart(2)}  ${ch.cls.padEnd(42)} "${ch.txt}"`);
+}
+
+// ---- v1.9.22 --assert：保存条必须铺到卡片两边缘，「保存并应用」按钮右缘与表单控件右缘对齐 ----
+// 不进 npm test（依赖本机 Chrome 路径）；改动设置页布局时手动跑：node tools/layout-repro.mjs --assert [--hostile]
+const s = res.saveBar || {};
+const near = (a, b, tol = 0.5) => Number.isFinite(a) && Number.isFinite(b) && Math.abs(a - b) <= tol;
+const r1 = (v) => (Number.isFinite(v) ? v.toFixed(1) : '?');
+if (process.argv.includes('--assert')) {
+  console.log(`\n[保存条] 按钮右缘 ${r1(s.buttonRight)} | 开关右缘 ${r1(s.toggleRight)} | 输入框右缘 ${r1(s.fieldRight)} | 卡片内容区 ${r1(s.innerLeft)}–${r1(s.innerRight)}`);
+  console.log(`[保存条] 底条 ${r1(s.barLeft)}–${r1(s.barRight)}（应 ${r1(s.innerLeft + s.barMarginLeft)}–${r1(s.innerRight - s.barMarginRight)}）| 外边距 ${s.barMarginLeft}/${s.barMarginRight} | max-width ${s.barMaxWidth}`);
+  const checks = [
+    ['「保存并应用」按钮右缘 = 开关右缘', near(s.buttonRight, s.toggleRight)],
+    ['「保存并应用」按钮右缘 = 输入框右缘', !Number.isFinite(s.fieldRight) || near(s.buttonRight, s.fieldRight)],
+    ['底条铺到卡片左内缘', near(s.barLeft, s.innerLeft + s.barMarginLeft)],
+    ['底条铺到卡片右内缘', near(s.barRight, s.innerRight - s.barMarginRight)],
+  ];
+  let bad = 0;
+  for (const [name, ok] of checks) { console.log(`  ${ok ? '✓' : '✗'} ${name}`); if (!ok) bad += 1; }
+  if (!Number.isFinite(s.buttonRight)) { console.log('  ✗ 没量到保存条 / 按钮'); bad += 1; }
+  if (bad) { console.error(`✗ 保存条对齐断言失败（${bad} 项）`); process.exit(1); }
+  console.log('✓ 保存条对齐断言通过');
 }

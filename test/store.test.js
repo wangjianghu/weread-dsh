@@ -151,3 +151,58 @@ describe('aux 通道', () => {
     assert.deepEqual(store.readAux('not-exist.json', 'fb'), 'fb');
   });
 });
+
+// v1.9.17 会话快照：阅读窗口「最近一次见到的有效会话」，供窗口不在场时恢复登录态
+describe('sessionSnapshot（v1.9.17）', () => {
+  test('读写往返：按账号隔离，带 savedAt', () => {
+    store.addAccount({ accountId: 'snap-a' });
+    store.addAccount({ accountId: 'snap-b' });
+    store.saveSessionSnapshot('snap-a', { wrVid: 'VA', wrSkey: 'SA' });
+    const a = store.getSessionSnapshot('snap-a');
+    assert.equal(a.wrVid, 'VA'); assert.equal(a.wrSkey, 'SA');
+    assert.ok(a.savedAt > 0);
+    assert.equal(store.getSessionSnapshot('snap-b'), undefined, '按账号隔离：另一账号读不到');
+  });
+
+  test('空壳/残缺快照：不写入（旧快照保留）、不读出', () => {
+    store.saveSessionSnapshot('snap-c', { wrVid: 'VC', wrSkey: 'SC' });
+    store.saveSessionSnapshot('snap-c', { wrVid: '', wrSkey: '' });     // 空壳
+    store.saveSessionSnapshot('snap-c', { wrVid: 'VC-only' });          // 缺 skey
+    store.saveSessionSnapshot('snap-c', undefined);
+    assert.equal(store.getSessionSnapshot('snap-c').wrSkey, 'SC', '空壳/残缺不覆盖已有快照');
+  });
+
+  test('随会话凭据一起清除（登出/删号链路）——登出后不得残留', () => {
+    store.addAccount({ accountId: 'snap-d' });
+    store.saveSessionSnapshot('snap-d', { wrVid: 'VD', wrSkey: 'SD' });
+    store.saveSimpleBrowserAuth('snap-d', { cookies: 'wr_vid=VD; wr_skey=SD', token: 'SD' });
+    store.clearCookies('snap-d'); // 登出/删号/移除账号链路（auth.logout / logoutAccount / removeAccount）
+    assert.equal(store.getSessionSnapshot('snap-d'), undefined, '登出清 cookies 时快照同清');
+  });
+
+  test('凭据判死后的降级**不清**快照——那正是快照要用的时刻（首版设计缺陷的回归线）', () => {
+    // auth.clearCredentialsForActiveAccount 在凭据失效时调用 clearSimpleBrowserAuth（有意不清 cookies）。
+    // 首版把快照清理挂在 clearSimpleBrowserAuth 上 → 凭据一失效快照即被清 → 功能不可能工作。
+    store.addAccount({ accountId: 'snap-f' });
+    store.saveSessionSnapshot('snap-f', { wrVid: 'VF', wrSkey: 'SF' });
+    store.saveSimpleBrowserAuth('snap-f', { cookies: 'wr_vid=VF; wr_skey=SF', token: 'SF' });
+    store.clearUserInfo?.();
+    store.clearSimpleBrowserAuth('snap-f'); // 凭据降级路径
+    assert.ok(store.getSessionSnapshot('snap-f'), '凭据降级后快照必须仍在（否则失效时无从恢复）');
+    assert.equal(store.getSessionSnapshot('snap-f').wrSkey, 'SF');
+  });
+
+  test('快照存进 secrets.json 且文件权限 0600（含 skey，保护不得弱于现有凭据）', () => {
+    store.addAccount({ accountId: 'snap-e' });
+    store.saveSessionSnapshot('snap-e', { wrVid: 'VE', wrSkey: 'SE-SECRET' });
+    const dir = fs.readdirSync(os.tmpdir()).map((d) => path.join(os.tmpdir(), d)).find((d) => {
+      try { return fs.existsSync(path.join(d, 'secrets.json')) && fs.readFileSync(path.join(d, 'secrets.json'), 'utf8').includes('SE-SECRET'); } catch { return false; }
+    });
+    assert.ok(dir, '快照落盘在 secrets.json（而非另起文件）');
+    const mode = fs.statSync(path.join(dir, 'secrets.json')).mode & 0o777;
+    if (process.platform !== 'win32') assert.equal(mode, 0o600, `secrets.json 权限应为 0600，实际 ${mode.toString(8)}`);
+    // 不得出现独立的快照文件（那会以默认权限落盘）
+    const stray = fs.readdirSync(dir).filter((f) => /snapshot|session/i.test(f) && !/^index\./.test(f));
+    assert.deepEqual(stray, [], `不应有独立快照文件：${stray.join(',')}`);
+  });
+});

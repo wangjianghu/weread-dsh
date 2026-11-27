@@ -9,6 +9,7 @@ import {
   normalizeBookItem,
   transformNotes,
   normalizePcUrl,
+  extractReaderBookId,
 } from '../lib/api.js';
 
 describe('extractSessionFromCookies', () => {
@@ -112,4 +113,27 @@ describe('transformNotes', () => {
 
 test('BASE_URL 常量', () => {
   assert.equal(BASE_URL, 'https://i.weread.qq.com');
+});
+
+// v1.9.19：「问 DSH」按页面 URL 里的 bookId 精确找书
+describe('extractReaderBookId', () => {
+  test('普通书页 / 公众号文章页', () => {
+    assert.equal(extractReaderBookId('https://weread.qq.com/web/reader/a57325c05c8ed3a57224187'), 'a57325c05c8ed3a57224187');
+    assert.equal(extractReaderBookId('https://weread.qq.com/web/reader/12345'), '12345');
+    assert.equal(extractReaderBookId('https://weread.qq.com/web/mp/reader/MP_WXS_abc'), 'MP_WXS_abc');
+  });
+  test('去掉查询串与 hash；URL 编码的 ID 解码', () => {
+    assert.equal(extractReaderBookId('https://weread.qq.com/web/reader/b1?k=1'), 'b1');
+    assert.equal(extractReaderBookId('https://weread.qq.com/web/reader/b1#chapter2'), 'b1');
+    assert.equal(extractReaderBookId('https://weread.qq.com/web/reader/%E4%B9%A6'), '书');
+  });
+  test('非阅读页（首页/书架）与非法输入 → 空串', () => {
+    assert.equal(extractReaderBookId('https://weread.qq.com/'), '');
+    assert.equal(extractReaderBookId('https://weread.qq.com/web/shelf'), '');
+    assert.equal(extractReaderBookId('https://weread.qq.com/web/book/info/x'), '');
+    assert.equal(extractReaderBookId(''), '');
+    assert.equal(extractReaderBookId(undefined), '');
+    assert.equal(extractReaderBookId(null), '');
+    assert.equal(extractReaderBookId(123), '');
+  });
 });

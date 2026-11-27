@@ -199,3 +199,38 @@ describe('业务方法', () => {
     assert.equal(pr.reviews[0].star, 5);
   });
 });
+
+// v1.9.19：skill_version 可由宿主注入（设置页一键升级后即用新值，无需重启）
+describe('skillVersion（v1.9.19）', () => {
+  test('缺省：每个请求都带内置常量', () => {
+    const { client, calls } = makeClient(() => jsonResponse({}));
+    client.setApiKey('wrk-test');
+    assert.equal(client.skillVersion(), SKILL_VERSION);
+    return client.ping().then(() => assert.equal(calls[0].body.skill_version, SKILL_VERSION));
+  });
+  test('内置默认值固化为 1.0.6（v1.9.21：真机逐接口验证过的官方版本）', () => {
+    assert.equal(SKILL_VERSION, '1.0.6');
+  });
+  test('注入合法版本：请求体即用新值（无需重建客户端）', async () => {
+    let v = '1.0.6';
+    const { client, calls } = makeClient(() => jsonResponse({}), { getSkillVersion: () => v });
+    client.setApiKey('wrk-test');
+    assert.equal(client.skillVersion(), '1.0.6');
+    await client.ping();
+    v = 'v1.1.0'; // 升级后再请求 → 立即生效
+    await client.ping();
+    assert.deepEqual(calls.map((c) => c.body.skill_version), ['1.0.6', '1.1.0']);
+  });
+  test('注入非法值 / 抛异常：回落到内置常量（不带脏值出门）', async () => {
+    for (const bad of ['', '  ', '1.0', 'latest', '1.0.6-beta', null, undefined, 7, '1.0.6; drop']) {
+      const { client, calls } = makeClient(() => jsonResponse({}), { getSkillVersion: () => bad });
+      client.setApiKey('wrk-test');
+      await client.ping();
+      assert.equal(calls[0].body.skill_version, SKILL_VERSION, `非法值 ${JSON.stringify(bad)} 应回落`);
+    }
+    const { client, calls } = makeClient(() => jsonResponse({}), { getSkillVersion: () => { throw new Error('boom'); } });
+    client.setApiKey('wrk-test');
+    await client.ping();
+    assert.equal(calls[0].body.skill_version, SKILL_VERSION);
+  });
+});

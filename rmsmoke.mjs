@@ -65,7 +65,17 @@ const renderWithText = (label, comp, props, mustInclude) => {
     const missing = (mustInclude || []).filter((s) => !all.includes(s));
     if (missing.length) { console.error(`  ✗ ${label} 缺少文案：${missing.join('、')}`); process.exitCode = 1; }
     else console.log(`  ✓ ${label} 渲染成功（${n} 节点，文案齐全）`);
+    return all;
   } catch (e) { console.error(`  ✗ ${label} 崩溃：${e.message}`); process.exitCode = 1; }
+};
+
+// v1.9.14：带「不得出现」断言的渲染——mustExclude 中任一子串出现即失败（用于「已登录不显示二维码/Cookie」）
+const renderWithoutText = (label, comp, props, mustInclude, mustExclude) => {
+  const all = renderWithText(label, comp, props, mustInclude);
+  if (typeof all !== 'string') return; // 渲染已失败
+  const present = (mustExclude || []).filter((s) => all.includes(s));
+  if (present.length) { console.error(`  ✗ ${label} 不应出现的文案：${present.join('、')}`); process.exitCode = 1; }
+  else console.log(`  ✓ ${label} 不含受限文案（${(mustExclude || []).length} 项）`);
 };
 
 // 空会话
@@ -117,18 +127,40 @@ renderWithText('Settings（Cookie 上次续命·自动续命）', W.Settings, {
   },
   onToast: () => {}, refreshState: async () => {},
 }, ['当前账号 Cookie 上次续命：5 分钟前', '自动续命']);
-renderWithText('LoginModal（三通道 tab）', W.LoginModal, { onClose: () => {}, onDone: () => {}, loggedIn: true },
+// v1.2.3 三通道 tab 原用例断言「已登录仍显示扫码/Cookie」——v1.9.14 起语义反转：
+// 已登录收起扫码/Cookie 入口（见下方 v1.9.14 用例）；三通道齐全的场景改为未登录态覆盖。
+renderWithText('LoginModal（未登录：三通道 tab）', W.LoginModal, { onClose: () => {}, onDone: () => {}, loggedIn: false },
   ['扫码登录', '粘贴 Cookie 登录', 'API Key（官方）']);
+// v1.9.14：已登录 → 不显示扫码/Cookie 入口（避免重复登录），改为「当前已登录」提示 + 仅留 API Key 通道。
+// 排除断言用 Cookie 芯片的专属文案（「粘贴 Cookie 登录」只作为芯片 label 出现；「扫码登录」是
+// 已登录提示语「阅读窗口里扫码登录后…」的子串，不能用作排除项）。折叠入口默认收起，其提示文案不在此断言。
+renderWithoutText('LoginModal（已登录：不显示二维码/Cookie）', W.LoginModal, { onClose: () => {}, onDone: () => {}, loggedIn: true },
+  ['当前已登录', '无需重复登录', 'API Key（官方）', '▸ 仍要登录其他账号'], ['粘贴 Cookie 登录']);
+// v1.9.14：新增文案在场性（折叠入口的提示文案属于 W.t，直接校验字典）
+renderWithText('LoginModal（v1.9.14 新增文案在场）', W.LoginModal, { onClose: () => {}, onDone: () => {}, loggedIn: true },
+  ['当前已登录', '无需重复登录', '阅读窗口', '仍要登录其他账号']);
+if (typeof W.t.loginSwitchAccountHint !== 'string' || !W.t.loginSwitchAccountHint) { console.error('  ✗ v1.9.14：换号入口提示文案缺失'); process.exitCode = 1; }
+else console.log('  ✓ v1.9.14：换号入口提示文案在场（展开后显示）');
 // v1.2.3：通道状态条——v1.2.4 起 label 只留「圆点+名称」，状态说明进 hover(title)
-renderWithText('LoginModal（通道状态：Key 有效 + Cookie 过期）', W.LoginModal, {
+renderWithText('LoginModal（通道状态：Key 有效 + Cookie 过期；已登录收起 Cookie 入口）', W.LoginModal, {
   onClose: () => {}, onDone: () => {}, loggedIn: true, initialTab: 'apikey',
-  gateway: { enabled: true, keyTail: 'PgAA', skillVersion: '1.0.5' },
+  gateway: { enabled: true, keyTail: 'Ab12', skillVersion: '1.0.5' },
   channels: {
     cookie: { present: true, valid: false, expired: true },
-    apiKey: { bound: true, keyTail: 'PgAA', valid: true },
+    apiKey: { bound: true, keyTail: 'Ab12', valid: true },
     lastCheckAt: Date.now(),
   },
-}, ['API Key（官方）', '扫码登录', '粘贴 Cookie 登录', '已绑定 ····PgAA（有效）', 'Cookie 已过期']);
+}, ['API Key（官方）', '已绑定 ····Ab12（有效）', '当前已登录']);
+// v1.9.14：未登录 + Key 有效 Cookie 过期 → 扫码/Cookie 入口照常（这是「过期需重登」的主场景）
+renderWithText('LoginModal（未登录 + Key 有效 + Cookie 过期：扫码/Cookie 入口照常）', W.LoginModal, {
+  onClose: () => {}, onDone: () => {}, loggedIn: false, initialTab: 'apikey',
+  gateway: { enabled: true, keyTail: 'Ab12', skillVersion: '1.0.5' },
+  channels: {
+    cookie: { present: true, valid: false, expired: true },
+    apiKey: { bound: true, keyTail: 'Ab12', valid: true },
+    lastCheckAt: Date.now(),
+  },
+}, ['API Key（官方）', '扫码登录', '粘贴 Cookie 登录', '已绑定 ····Ab12（有效）', 'Cookie 已过期']);
 renderWithText('LoginModal（通道状态：全部未配置）', W.LoginModal, {
   onClose: () => {}, onDone: () => {}, loggedIn: false, initialTab: 'apikey',
   channels: { cookie: { present: false, valid: false, expired: false }, apiKey: { bound: false, keyTail: '', valid: false }, lastCheckAt: 0 },

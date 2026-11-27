@@ -4,6 +4,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { apply } from './index.js';
 import { createReaderWindow } from './lib/readerWindow.js';
+import { SKILL_VERSION } from './lib/gateway.js'; // 内置默认的官方 Skill 版本（断言不再写死版本号）
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wr-smoke-'));
 const outDir = path.join(tmp, 'notes');
@@ -33,6 +34,35 @@ let tool = registrations.tools.find((t) => t.name === 'weread');
 if (!tool) throw new Error('工具 weread 未注册');
 
 let asserts = 0; const ok = (cond, msg) => { if (!cond) throw new Error('FAIL: ' + msg); asserts++; console.log('  ✓', msg); };
+// v1.9.23：阅读窗口守护类断言的等待工具。守护周期在测试里被压到 15–40ms，「固定睡 N 毫秒再断言」等于赌
+// 异步链已经走完——慢机器（GitHub Actions 的 Node 24 档）上会误判（v1.9.13 之后 main 分支的 CI 因此红过一次：
+// 「渲染主线程无响应×2 → watchdog 自愈」在 120ms 内没等到自愈重开）。
+//   until(cond)          等到条件成立（返回 true）或超时（返回 false，断言照常失败）
+//   untilQuiet(valueOf)  等到取值连续 quietMs 毫秒没再变（「已停摆」类断言用；守护若没停，取值会一直变，直到超时）
+//   pause(ms)            纯等待，只用在「观察窗」语义的地方（等够一段时间看有没有多余调用）
+const pause = (ms) => new Promise((res) => setTimeout(res, ms));
+const until = async (cond, timeoutMs = 8000, stepMs = 10) => {
+  const end = Date.now() + timeoutMs;
+  for (;;) {
+    let hit = false;
+    try { hit = !!cond(); } catch { /* 条件里的读取可能撞上文件写到一半，下一轮再试 */ }
+    if (hit) return true;
+    if (Date.now() >= end) return false;
+    await pause(stepMs);
+  }
+};
+const untilQuiet = async (valueOf, quietMs = 250, timeoutMs = 8000, stepMs = 20) => {
+  const end = Date.now() + timeoutMs;
+  let last = valueOf();
+  let since = Date.now();
+  for (;;) {
+    await pause(stepMs);
+    const cur = valueOf();
+    if (cur !== last) { last = cur; since = Date.now(); }
+    else if (Date.now() - since >= quietMs) return true;
+    if (Date.now() >= end) return false;
+  }
+};
 
 // v1.9.11 宿主调用方认证：固定 token 全链携带；验证无凭据/错 token 两条拒绝路径 + endpoint 分发。
 let API_TOKEN = SMOKE_TOKEN;
@@ -507,7 +537,7 @@ ok(r.status === 200 && r.payload.ok && fs.existsSync(r.payload.path), '备份 zi
   ok(pingBody.api_name === '/user/notebooks' && pingBody.count === 1, 'ping 走 /user/notebooks 最小请求');
   const nb = await gw.notebooksAll();
   const nbBody = calls.map((c) => JSON.parse(c.init.body)).find((b) => b.api_name === '/user/notebooks' && b.count === 50);
-  ok(nbBody && nbBody.skill_version === '1.0.5' && nbBody.params === undefined, '请求体：api_name/参数平铺 + skill_version');
+  ok(nbBody && nbBody.skill_version === SKILL_VERSION && nbBody.params === undefined, '请求体：api_name/参数平铺 + skill_version');
   ok(nb.books.length === 3 && calls.some((c) => JSON.parse(c.init.body).lastSort === 50), 'notebooks 翻页（lastSort=末项 sort 游标，禁 offset）');
   const rv = await gw.myReviewsAll('b1');
   ok(rv.length === 2 && calls.some((c) => JSON.parse(c.init.body).synckey === 77), 'myReviews 翻页（synckey 游标）');
@@ -558,6 +588,7 @@ ok(r.status === 200 && r.payload.ok && fs.existsSync(r.payload.path), '备份 zi
     [{ bookId: 'b1', localCount: 2 }, { bookId: 'b2', localCount: 5 }],
   );
   ok(rec.checked === 2 && rec.mismatchedCount === 1 && rec.mismatched[0].title === '书1' && rec.mismatched[0].expected === 3 && rec.mismatched[0].local === 2, '对账：差异定位（expected=noteCount+reviewCount）');
+  ok(rec.localLowerCount === 1 && rec.localHigherCount === 0, '对账：全量方向计数（本地偏少 1、偏多 0）——界面文案按它判断方向');
 
   // --- auth：API Key 登录（独立/绑定/登出清 Key）---
   const { createAuthManager } = await import('./lib/auth.js');
@@ -649,7 +680,7 @@ ok(r.status === 200 && r.payload.ok && fs.existsSync(r.payload.path), '备份 zi
           // B1：cookie 书架也在，但 cookie 计数滞后（reviewCount=0）→ 网关订正为 1 → 触发补采
           { bookId: 'B1', noteCount: 1, reviewCount: 1, readingProgress: 0.5, markedStatus: 0, sort: 1700000100, book: { title: '计数订正书' } },
           // B2：cookie 书架完全没有（只有 1 条书评无划线）→ 追加进同步清单
-          { bookId: '26639874', noteCount: 0, reviewCount: 1, readingProgress: 0, markedStatus: 0, sort: 1572533138, book: { title: '阿加莎式书评书', author: '某作者' } },
+          { bookId: '26639874', noteCount: 0, reviewCount: 1, readingProgress: 0, markedStatus: 0, sort: 1572533138, book: { title: '只有书评的文集', author: '某作者' } },
           // B3：服务端无标题的公众号 → 文件名回退 bookId
           { bookId: 'MP_WXS_TEST1', noteCount: 1, reviewCount: 0, sort: 1555196435, book: { title: '', author: '公众号' } },
         ],
@@ -692,6 +723,7 @@ ok(r.status === 200 && r.payload.ok && fs.existsSync(r.payload.path), '备份 zi
   ok(!!b1File && fs.readFileSync(b1File, 'utf8').includes('网关想法'), 'cookie 计数滞后被网关订正后触发想法补采');
   const syncStateGw3 = stGw3.getState('666', 'syncState', {});
   ok(syncStateGw3.reconcile && syncStateGw3.reconcile.mismatchedCount === 0 && syncStateGw3.reconcile.checkedBooks === 3, `网关驱动对账归零（checked=${syncStateGw3.reconcile?.checkedBooks} mismatch=${syncStateGw3.reconcile?.mismatchedCount}）`);
+  ok(syncStateGw3.reconcile?.localHigherCount === 0 && syncStateGw3.reconcile?.localLowerCount === 0, '对账结果落 state 时带全量方向计数（界面据此说话）');
   // 文件名回退纯函数
   ok(markdownLib.buildFileName({ title: '', bookId: 'MP_WXS_X', rawBookId: 'MP_WXS_X' }) === 'MP_WXS_X'
     && markdownLib.buildFileName({ title: '未命名书籍', bookId: '3300012345' }) === '3300012345'
@@ -817,6 +849,59 @@ ok(r.status === 200 && r.payload.ok && fs.existsSync(r.payload.path), '备份 zi
   const p01Back2 = (mdLib.parseBookMarkdownContent(p01Md2, '/tmp/p01b.md')).notes ?? [];
   const diff3 = syncLib.detectNoteChanges(p01Back2, remoteNotes);
   ok(diff3.added.length === 0 && diff3.modified.length === 0 && diff3.deleted.length === 0, '第三轮稳态 diff 仍全零（锚点自持）');
+}
+
+// v1.9.20：同一条笔记的「旧形态副本」不再按 local-only 保留（真机：25 本书 59 条副本，对账 25/25 本「本地 = 2×服务端」）
+{
+  const mdLib = await import('./lib/markdown.js');
+  const syncLib = await import('./lib/sync.js');
+  const book = { bookId: 'DUP1', rawBookId: 'DUP1', title: '去重书', author: '甲', category: '科技', progress: 10, noteCount: 2, reviewCount: 0, pcUrl: 'https://x' };
+  const remote = [
+    { noteId: 'DUP1_3_637-648', type: 1, chapterTitle: '一', highlightText: '划线甲', createTime: 1700000000, modifyTime: 1700000000 },
+    { noteId: 'DUP1_3_1360-1384', type: 1, chapterTitle: '一', highlightText: '划线乙\n第二行', createTime: 1700000001, modifyTime: 1700000001 },
+  ];
+  const HASH = /^local_[0-9a-f]{12}$/;
+  // v1.8.5-batch2 之前的文件：渲染器不给 local_pending ID 出锚点 → 读回全是内容哈希 ID
+  const legacyMd = mdLib.renderBookMarkdown(book, remote.map((n, i) => ({ ...n, noteId: `local_pending_${i}` })), {});
+  const legacy = (mdLib.parseBookMarkdownContent(legacyMd, '/tmp/dup-legacy.md')).notes ?? [];
+  ok(!/wr:nid:/.test(legacyMd) && legacy.length === 2 && legacy.every((n) => HASH.test(n.noteId)), '前置：旧格式文件无锚点，读回是内容哈希 ID');
+  ok(syncLib.mergeWithLocalNotes(legacy, remote).length === 2, '旧文件对上远端不再翻倍（原版：哈希 ID 对不上 bookmarkId，两套都写盘 = 4）');
+  const healed = syncLib.mergeWithLocalNotes([...remote, ...legacy], remote);
+  ok(healed.length === 2 && healed.every((n) => remote.some((r) => r.noteId === n.noteId)), '存量翻倍文件一轮合并自愈：只剩带锚点的一套');
+  const healedMd = mdLib.renderBookMarkdown(book, healed, {});
+  const back = (mdLib.parseBookMarkdownContent(healedMd, '/tmp/dup-healed.md')).notes ?? [];
+  const stable = syncLib.detectNoteChanges(back, remote);
+  ok(stable.added.length + stable.modified.length + stable.deleted.length === 0 && !/wr:nid:local_/.test(healedMd), '自愈后落盘无哈希锚点，下一轮 diff 全零（幂等）');
+  const manual = { noteId: mdLib.buildStableLocalNoteId('DUP1', { chapterTitle: '一', type: 1, highlightText: '我手加的', createTime: 1 }), type: 1, chapterTitle: '一', highlightText: '我手加的', createTime: 1 };
+  ok(syncLib.mergeWithLocalNotes([...legacy, manual], remote).length === 3, '手加笔记（哈希 ID、内容不在远端）保留');
+  const edited = { ...legacy[0], highlightText: `${legacy[0].highlightText}（本地改过）` };
+  ok(syncLib.mergeWithLocalNotes([...legacy.slice(1), edited], remote).length === 3, '本地改过的旧副本保留（内容已不同 = 用户资产）');
+  const otherTime = { ...legacy[0], createTime: 1700000000 + 60 };
+  ok(syncLib.mergeWithLocalNotes([otherTime], remote).length === 3, '文本相同但记录时间不同（双方都有）→ 两条笔记，不判副本');
+  const remoteNoTime = remote.map((n) => ({ ...n, createTime: 0 })); // web 新管线划线缺 createTime
+  const keptBoth = syncLib.mergeWithLocalNotes([legacy[0]], remoteNoTime);
+  ok(keptBoth.length === 3 && keptBoth[0].createTime === 0 && remoteNoTime[0].createTime === 0, '任一侧没有记录时间 → 不判副本，也不把副本的时间安到保留笔记上');
+  ok(syncLib.mergeWithLocalNotes([{ ...legacy[0], createTime: 1700000001 }, { ...legacy[0], createTime: 1700000999 }], [{ ...remote[0], createTime: 0 }]).length === 3, '同一句话划两次、远端无记录时间、其中一条远端已删 → 两条都保留');
+  ok(syncLib.mergeWithLocalNotes([{ ...legacy[0], createTime: 0 }], remote).length === 3, '与远端划线同文、但自己没有记录时间的笔记 → 保留（分不出旧副本还是手加）');
+  ok(syncLib.mergeWithLocalNotes([{ ...legacy[0], createTime: 0 }], remoteNoTime).length === 3, '两侧都没有记录时间 → 同样不判副本（等远端带回真实时间再清）');
+  const wsVariant = { ...legacy[1], highlightText: `  ${remote[1].highlightText.replace('\n', '   ')}  ` };
+  ok(syncLib.mergeWithLocalNotes([wsVariant], remote).length === 2, '空白归一：副本与保留笔记只差空白/换行 → 仍是副本');
+  ok(syncLib.mergeWithLocalNotes([{ ...legacy[0], thoughtText: '旧文件里这条还带着想法' }], remote).length === 3, '内容键含想法：划线相同、想法不同 → 不是副本');
+  // 旧独立想法：某轮划线只返回残缺数据 → 想法落成独立笔记；划线拉全后想法挂回划线
+  const bm = [{ noteId: 'DUP1_1_5-9', type: 1, chapterTitle: '一', highlightText: '划线丙', createTime: 1700000000 }];
+  const attached = { attached: [{ reviewId: 'rv1', bookId: 'DUP1', content: '想法丁', abstract: '划线丙', range: '5-9', createTime: 1700000005 }], chapterComments: [], bookReviews: [] };
+  const { notes: withThought, absorbedReviews } = syncLib.mergeReviewsIntoNotes(bm, attached);
+  ok(absorbedReviews.size === 1 && absorbedReviews.get('rv1') === 'DUP1_1_5-9', '想法合并回报：想法 ID → 挂上去的那条笔记的 ID');
+  const stale = { noteId: 'rv1', bookId: 'DUP1', type: 2, chapterTitle: '一', highlightText: '划线丙', thoughtText: '想法丁', createTime: 1700000005 };
+  const afterReview = syncLib.mergeWithLocalNotes([stale], withThought, { absorbedReviews });
+  ok(afterReview.length === 1 && afterReview[0].thoughtText === '想法丁' && !afterReview.some((n) => n.noteId === 'rv1'), '想法挂回划线后，旧的独立想法副本不再保留（原版：划线上挂一份 + 独立一份）');
+  ok(syncLib.mergeWithLocalNotes([{ ...stale, thoughtText: '想法丁（本地改过）' }], withThought, { absorbedReviews }).length === 2, '本地改过的旧独立想法保留');
+  ok(syncLib.mergeWithLocalNotes([stale], withThought).length === 2 && syncLib.mergeWithLocalNotes([stale], withThought, { absorbedReviews: new Map([['rv9', 'DUP1_1_5-9']]) }).length === 2, '本轮没拉想法 / 想法 ID 对不上 → 不动本地笔记');
+  // 本地划线在 ID 合并中胜出且没有这条想法 → 旧独立想法是这条想法在文件里唯一的出处，必须保留
+  const { notes: remoteNoTimeThought, absorbedReviews: absorbedNoTime } = syncLib.mergeReviewsIntoNotes([{ ...bm[0], createTime: 0 }], attached);
+  const localWins = { ...bm[0], createTime: 1700000000 };
+  const keptForThought = syncLib.mergeWithLocalNotes([localWins, stale], remoteNoTimeThought, { absorbedReviews: absorbedNoTime });
+  ok(keptForThought.length === 2 && keptForThought[0].thoughtText === undefined && keptForThought.some((n) => n.thoughtText === '想法丁'), '本地划线胜出且没有这条想法 → 旧独立想法保留（想法不从文件里消失）');
 }
 
 // 13.686b v1.8.15：创建时间不伪造（web 新管线划线无 createTime）+ 远端权威修复 + 未知时间聚合豁免
@@ -1011,7 +1096,7 @@ ok(r.status === 400, 'apikey 登录空 Key 400');
 r = await call('POST', '/weread/api/gateway/test', {});
 ok(r.status === 400, 'gateway/test 未绑定 400');
 r = await call('GET', '/weread/api/state');
-ok(r.payload.gateway && r.payload.gateway.enabled === false && r.payload.gateway.skillVersion === '1.0.5', 'state 含 gateway 状态（未绑定+版本）');
+ok(r.payload.gateway && r.payload.gateway.enabled === false && r.payload.gateway.skillVersion === SKILL_VERSION, 'state 含 gateway 状态（未绑定+版本）');
 
 // 13.6955 v1.5 单例阅读窗口（lib/readerWindow.js，全假依赖：不拉真 Chrome）
 {
@@ -1083,8 +1168,8 @@ ok(r.payload.gateway && r.payload.gateway.enabled === false && r.payload.gateway
     const injBefore = calls.ws.filter((m) => m === 'Runtime.evaluate:readerbar').length;
     world.url = 'https://weread.qq.com/web/reader/next'; // 模拟新文档（URL 变化）
     world.targets = [tgt(0)]; // tgt() 读 world.url，需重建目标对象
-    await new Promise((r2) => setTimeout(r2, 90)); // injectWatch=15ms，等几个周期
-    ok(calls.ws.filter((m) => m === 'Runtime.evaluate:readerbar').length > injBefore, '注入守护：URL 变化后自动补注入（常态零附着）');
+    const reinjected = await until(() => calls.ws.filter((m) => m === 'Runtime.evaluate:readerbar').length > injBefore); // injectWatch=15ms：等到补注入真的发生
+    ok(reinjected, '注入守护：URL 变化后自动补注入（常态零附着）');
   }
 
   const setCookiesBefore = calls.ws.filter((m) => m.startsWith('Network.setCookie')).length;
@@ -1124,9 +1209,11 @@ ok(r.payload.gateway && r.payload.gateway.enabled === false && r.payload.gateway
 
   // v1.5.4 bounds 守护：阅读期间（无任何点击/关窗动作）调整窗口 → 周期内自动记忆
   world.bounds = { left: 99, top: 88, width: 700, height: 500, windowState: 'normal' };
-  await new Promise((r) => setTimeout(r, 90)); // boundsWatch=15ms，等几个守护周期（真定时器）
-  const stB = JSON.parse(fs.readFileSync(path.join(rwDir, 'reader-window.json'), 'utf8'));
-  ok(stB.bounds && stB.bounds.width === 700 && stB.bounds.left === 99, 'bounds 守护：阅读中调整窗口即被记忆（修复 1.5.3 只在 open/close 时捕获的缺陷）');
+  const stPath = path.join(rwDir, 'reader-window.json');
+  const boundsSeen = (s) => !!(s && s.bounds && s.bounds.width === 700 && s.bounds.left === 99);
+  const boundsKept = await until(() => boundsSeen(JSON.parse(fs.readFileSync(stPath, 'utf8')))); // boundsWatch=15ms：等到守护把新值记下来（真定时器）
+  const stB = JSON.parse(fs.readFileSync(stPath, 'utf8'));
+  ok(boundsKept && boundsSeen(stB), 'bounds 守护：阅读中调整窗口即被记忆（修复 1.5.3 只在 open/close 时捕获的缺陷）');
   rw.dispose();
   const c = await rw.closeWindow();
   ok(c.ok === true, 'closeWindow 走通（Browser.close）');
@@ -1196,8 +1283,8 @@ ok(r.payload.gateway && r.payload.gateway.enabled === false && r.payload.gateway
     const rwJam = createReaderWindow({ stateDir: rwDir, log: () => {}, getCookies: () => undefined, deps: depsJam });
     world.url = 'https://weread.qq.com/web/reader/jam'; world.targets = [tgt(0)];
     await rwJam.open('https://weread.qq.com/web/reader/jam');
-    await new Promise((r2) => setTimeout(r2, 120)); // jamWatch=15ms：两击探针 + 自愈重开
-    ok(calls.closed.length > closedBefore && calls.launch > launchBeforeJ, '渲染主线程无响应×2 → watchdog 自愈（关页重开）');
+    const healed = await until(() => calls.closed.length > closedBefore && calls.launch > launchBeforeJ); // jamWatch=15ms：等到两击探针 + 自愈重开真的发生
+    ok(healed, '渲染主线程无响应×2 → watchdog 自愈（关页重开）');
     rwJam.dispose();
   }
 
@@ -1225,6 +1312,11 @@ ok(r.payload.gateway && r.payload.gateway.enabled === false && r.payload.gateway
   ok(!/\)\(\);\s*;\s*inject\(\)/.test(boot2) && !boot2.trimEnd().endsWith('inject();'), '注入脚本结尾不再调用作用域外 inject()（原每次注入必抛 ReferenceError）');
 
   // --- 独立假世界 v2：可门控的 watchdog 自愈 sleep，用于确定性复现 dispose 竞态 ---
+  // v1.9.16：区分「注入脚本」与「工具条探测」——两者表达式都含 wr-readerbar，按字面量识别会把
+  // 只读探测误计为注入（曾据此误判「同一文档重复注入 13 次」，并多加了一段限频逻辑）。
+  // 注入脚本独有 `window.close = wrClose`（BOOTSTRAP_SCRIPT 开头）；探测是 pageHasToolbar 的单表达式。
+  const isInjectScript = (expr) => typeof expr === 'string' && expr.includes('wr-readerbar') && expr.includes('window.close = wrClose');
+  const isToolbarProbe = (expr) => typeof expr === 'string' && expr.trim().startsWith('!!document.getElementById(') && expr.trim().endsWith("('wr-readerbar')") ;
   const mkWorld = (dirName, port) => {
     const dir = path.join(tmp, dirName);
     fs.mkdirSync(dir, { recursive: true });
@@ -1245,7 +1337,9 @@ ok(r.payload.gateway && r.payload.gateway.enabled === false && r.payload.gateway
         c.liveNow = (c.liveNow || 0) + 1;
         c.maxLive = Math.max(c.maxLive || 1, c.liveNow);
         try {
-          if (w.evalDelayMs && commands.some((cmd) => cmd.method === 'Runtime.evaluate' && cmd.params?.expression?.includes('wr-readerbar'))) {
+          // v1.9.16：以注入脚本的独有特征识别——不能用 'wr-readerbar' 字面量，pageHasToolbar 的只读探测
+          // （!!document.getElementById('wr-readerbar')）也会被误计为注入。
+          if (w.evalDelayMs && commands.some((cmd) => cmd.method === 'Runtime.evaluate' && isInjectScript(cmd.params?.expression))) {
             c.evalLive = (c.evalLive || 0) + 1;
             c.maxEvalLive = Math.max(c.maxEvalLive || 1, c.evalLive);
             try { await new Promise((r3) => setTimeout(r3, w.evalDelayMs)); } // 模拟页面卡顿：注入 evaluate 慢
@@ -1253,7 +1347,7 @@ ok(r.payload.gateway && r.payload.gateway.enabled === false && r.payload.gateway
           }
           for (const cmd of commands) {
             c.methods.push(cmd.method
-              + (cmd.params?.expression?.includes('wr-readerbar') ? ':bar' : cmd.params?.expression === '1' ? ':probe' : ''));
+              + (isInjectScript(cmd.params?.expression) ? ':bar' : isToolbarProbe(cmd.params?.expression) ? ':barprobe' : cmd.params?.expression === '1' ? ':probe' : ''));
             if (cmd.method === 'Browser.close') { w.alive = false; w.targets = []; }
             if (cmd.method === 'Runtime.evaluate' && cmd.params?.expression === '1' && w.probeFailRemaining > 0) {
               w.probeFailRemaining -= 1;
@@ -1284,8 +1378,9 @@ ok(r.payload.gateway && r.payload.gateway.enabled === false && r.payload.gateway
     const rw = createReaderWindow({ stateDir: dir, log: () => {}, getCookies: () => undefined, deps: depsX });
     await rw.open(w.url);
     w.probeFailRemaining = 1; // 只失败 1 次（<2 击）
-    await new Promise((r2) => setTimeout(r2, 130)); // jamWatch=30ms：数个周期
-    ok(c.closed.length === 0 && c.launch === 1, 'watchdog 单次探针失败后恢复 → 不自愈（strike 复位）');
+    const struck = await until(() => w.probeFailRemaining === 0); // 等那一击真的发生（jamWatch=30ms）
+    await pause(150); // 再过数个周期：恢复之后不得自愈
+    ok(struck && c.closed.length === 0 && c.launch === 1, 'watchdog 单次探针失败后恢复 → 不自愈（strike 复位）');
     rw.dispose();
   }
 
@@ -1296,7 +1391,7 @@ ok(r.payload.gateway && r.payload.gateway.enabled === false && r.payload.gateway
     await rw.open(w.url);
     holdJamSleep(); // 让自愈路径的 sleep(1500) 挂起
     w.probeFailRemaining = 2; // 连续 2 击 → 进入自愈：closeTarget → sleep(1500) 挂起
-    await new Promise((r2) => setTimeout(r2, 100)); // 等两击+进入等待
+    await until(() => c.closed.length >= 1); // 等两击 + 进入等待
     ok(c.closed.length === 1, '自愈已关页并进入重开等待（sleep 挂起）');
     rw.dispose(); // 宿主此刻退出（清定时器 + Browser.close）
     await new Promise((r2) => setTimeout(r2, 30));
@@ -1311,12 +1406,15 @@ ok(r.payload.gateway && r.payload.gateway.enabled === false && r.payload.gateway
     const { dir, c, w, depsX } = mkWorld('rw-quite', 47852);
     const rw = createReaderWindow({ stateDir: dir, log: () => {}, getCookies: () => undefined, deps: depsX });
     await rw.open(w.url);
-    await new Promise((r2) => setTimeout(r2, 90)); // 守护跑起来 + dispose 异步收尾完成
+    const fOpen = c.fetchN;
+    const guardsRan = await until(() => c.fetchN > fOpen); // 守护确实跑起来（至少一个探测周期）
     rw.dispose();
-    await new Promise((r2) => setTimeout(r2, 50));
+    // dispose 的收尾是异步的（探测 → Browser.close → 复探）：等它走完、计数连续 200ms 不变，再开始观察
+    await until(() => c.methods.includes('Browser.close'));
+    const settledDown = await untilQuiet(() => c.ws + c.fetchN, 200);
     const wsAfterDispose = c.ws, methodsAfter = c.methods.length;
-    await new Promise((r2) => setTimeout(r2, 160)); // 4 个周期无任何新调用 → 定时器确已全清
-    ok(c.ws === wsAfterDispose && c.methods.length === methodsAfter, 'dispose 后 inject/bounds/jam 守护全部停摆');
+    await pause(160); // 4 个周期无任何新调用 → 定时器确已全清
+    ok(guardsRan && settledDown && c.ws === wsAfterDispose && c.methods.length === methodsAfter, 'dispose 后 inject/bounds/jam 守护全部停摆');
   }
 
   // --- bounds 守护变更才写盘（同 bounds 周期静默，变化即记忆） ---
@@ -1324,15 +1422,20 @@ ok(r.payload.gateway && r.payload.gateway.enabled === false && r.payload.gateway
     const { dir, c, w, depsX } = mkWorld('rw-bw', 47853);
     const rw = createReaderWindow({ stateDir: dir, log: () => {}, getCookies: () => undefined, deps: depsX });
     await rw.open(w.url);
-    await new Promise((r2) => setTimeout(r2, 110)); // open 捕获 + 首个守护周期落盘
     const sf = path.join(dir, 'reader-window.json');
-    const stable = fs.readFileSync(sf, 'utf8');
-    await new Promise((r2) => setTimeout(r2, 140)); // boundsWatch=40ms：多个周期 bounds 未变
-    ok(fs.readFileSync(sf, 'utf8') === stable, 'bounds 未变周期不重复写盘（含 updatedAt 不动）');
+    // 等状态文件「已写出且连续 150ms（≥3 个 boundsWatch 周期）没再变」——不靠固定等待赌首个周期已落盘
+    let stable = null, stableSince = Date.now();
+    const settled = await until(() => {
+      const cur = fs.existsSync(sf) ? fs.readFileSync(sf, 'utf8') : null;
+      if (cur !== stable) { stable = cur; stableSince = Date.now(); return false; }
+      return stable !== null && Date.now() - stableSince >= 150;
+    });
+    ok(settled && fs.readFileSync(sf, 'utf8') === stable, 'bounds 未变周期不重复写盘（含 updatedAt 不动）');
     w.bounds = { left: 77, top: 88, width: 640, height: 480, windowState: 'normal' };
-    await new Promise((r2) => setTimeout(r2, 110));
+    const seen = (s) => !!(s && s.bounds && s.bounds.width === 640 && s.bounds.left === 77);
+    const kept = await until(() => seen(JSON.parse(fs.readFileSync(sf, 'utf8')))); // boundsWatch=40ms：等到守护记下新值
     const after = JSON.parse(fs.readFileSync(sf, 'utf8'));
-    ok(after.bounds && after.bounds.width === 640 && after.bounds.left === 77, 'bounds 变化后周期内记忆新值');
+    ok(kept && seen(after), 'bounds 变化后周期内记忆新值');
     rw.dispose();
   }
 
@@ -1356,17 +1459,19 @@ ok(r.payload.gateway && r.payload.gateway.enabled === false && r.payload.gateway
     const { dir, c, w, depsX } = mkWorld('rw-stop', 47855);
     const rw = createReaderWindow({ stateDir: dir, log: () => {}, getCookies: () => undefined, deps: depsX });
     await rw.open(w.url);
-    await new Promise((r2) => setTimeout(r2, 120)); // 守护跑起来
-    ok(c.fetchN > 0, '守护运行中（探测计数 > 0）');
+    const fOpen = c.fetchN;
+    const guardsRan = await until(() => c.fetchN > fOpen); // 守护跑起来（至少一个探测周期）
+    ok(guardsRan, '守护运行中（探测计数 > 0）');
     w.targets = []; // 用户红钮关窗（Chrome 实例还在）
-    await new Promise((r2) => setTimeout(r2, 350)); // 连续缺席 ≥5 轮 → 自动停摆
+    // 连续缺席 ≥5 轮 → 自动停摆：等探测计数连续 250ms 不再增长（守护没停的话计数会一直变，直到超时）
+    const stopped = await untilQuiet(() => c.fetchN, 250);
     const f0 = c.fetchN;
-    await new Promise((r2) => setTimeout(r2, 200));
-    ok(c.fetchN === f0, `关窗后守护自动停摆（200ms 内新增探测 ${c.fetchN - f0} 次）`);
+    await pause(200);
+    ok(stopped && c.fetchN === f0, `关窗后守护自动停摆（200ms 内新增探测 ${c.fetchN - f0} 次）`);
     const res = await rw.open(w.url); // 再开书：reopen + 守护重启
     ok(res.ok && c.launch === 2, '停摆后再 open 正常重开（同实例 reopen）');
-    await new Promise((r2) => setTimeout(r2, 120));
-    ok(c.fetchN > f0, 'open 后守护重启（探测恢复）');
+    const restarted = await until(() => c.fetchN > f0); // 等到守护重新探测
+    ok(restarted, 'open 后守护重启（探测恢复）');
     rw.dispose();
     await new Promise((r2) => setTimeout(r2, 30));
   }
@@ -1376,11 +1481,12 @@ ok(r.payload.gateway && r.payload.gateway.enabled === false && r.payload.gateway
     const { dir, c, depsX } = mkWorld('rw-cw', 47856);
     const rw = createReaderWindow({ stateDir: dir, log: () => {}, getCookies: () => undefined, deps: depsX });
     await rw.open('https://weread.qq.com/web/reader/cw');
-    await new Promise((r2) => setTimeout(r2, 90));
+    const fOpen = c.fetchN;
+    await until(() => c.fetchN > fOpen); // 守护跑起来
     await rw.closeWindow(); // Browser.close（wsCall 置 alive=false）
-    await new Promise((r2) => setTimeout(r2, 80)); // 收尾余波
+    await untilQuiet(() => c.fetchN, 200); // 收尾余波：在飞的探测落定
     const f0 = c.fetchN;
-    await new Promise((r2) => setTimeout(r2, 200));
+    await pause(200);
     ok(c.fetchN === f0, 'closeWindow 后守护立即停摆');
     rw.dispose();
   }
@@ -1395,10 +1501,14 @@ ok(r.payload.gateway && r.payload.gateway.enabled === false && r.payload.gateway
     const barBefore = c.methods.filter((m) => m === 'Runtime.evaluate:bar').length;
     w.url = 'https://weread.qq.com/web/reader/busy2'; // 新文档（URL 变化）
     w.targets = [{ id: 'P0', type: 'page', url: w.url, webSocketDebuggerUrl: 'ws://127.0.0.1:47857/devtools/page/P0' }];
-    await new Promise((r2) => setTimeout(r2, 1600)); // injectWatch=40ms：无防重入将叠 3+ 轮；P2-22 后 probe 有 700ms 成功缓存，窗口放宽到 ≥1.6s
-    const barAfter = c.methods.filter((m) => m === 'Runtime.evaluate:bar').length;
+    const barCount = () => c.methods.filter((m) => m === 'Runtime.evaluate:bar').length;
+    const t0 = Date.now();
+    const injected = await until(() => barCount() > barBefore); // 等到新文档的注入真的发生
+    const rest = 1600 - (Date.now() - t0);
+    if (rest > 0) await pause(rest); // 观察窗保持 ≥1.6s：injectWatch=40ms，无防重入将叠 3+ 轮；P2-22 后 probe 有 700ms 成功缓存
+    const barAfter = barCount();
     ok((c.maxEvalLive || 0) === 1, `防重入：慢注入期间并发 evaluate 峰值=1（max=${c.maxEvalLive}）`);
-    ok(barAfter === barBefore + 1, `同一文档只注入一次（新增 ${barAfter - barBefore} 次）`);
+    ok(injected && barAfter === barBefore + 1, `同一文档只注入一次（新增 ${barAfter - barBefore} 次）`);
     rw.dispose();
   }
 
@@ -1409,14 +1519,14 @@ ok(r.payload.gateway && r.payload.gateway.enabled === false && r.payload.gateway
     await rw.open(w.url);
     holdJamSleep(); // 门控自愈重开等待
     w.probeFailRemaining = 9999; // 持续假死
-    await new Promise((r2) => setTimeout(r2, 160)); // 两击 → 自愈：关页 + sleep 挂起
+    await until(() => c.closed.length >= 1); // 两击 → 自愈：关页 + sleep 挂起
     ok(c.closed.length === 1, '自愈关页一次（进入重开等待）');
-    await new Promise((r2) => setTimeout(r2, 150)); // 再过多个 jamWatch 周期
+    await pause(150); // 再过多个 jamWatch 周期
     ok(c.closed.length === 1 && c.launch === 1, `自愈进行中不叠加第二轮（closed=${c.closed.length}, launch=${c.launch}）`);
     w.probeFailRemaining = 0; // 探针恢复
     releaseJamSleep();
-    await new Promise((r2) => setTimeout(r2, 150)); // 恢复完成：重开 + 注入
-    ok(c.launch === 2 && c.methods.includes('Runtime.evaluate:bar'), '恢复完成后窗口重开 + 注入');
+    const recovered = await until(() => c.launch === 2 && c.methods.includes('Runtime.evaluate:bar')); // 恢复完成：重开 + 注入
+    ok(recovered, '恢复完成后窗口重开 + 注入');
     rw.dispose();
     await new Promise((r2) => setTimeout(r2, 30));
   }
@@ -2011,6 +2121,467 @@ ok(r.payload.gateway && r.payload.gateway.enabled === false && r.payload.gateway
   }
 }
 
+// 13.78c v1.9.16 真机回归线（服务级）：插件凭据是「空壳」时不得覆盖窗口里刚扫码的有效会话
+// 真机事故（2026-11-25 21:04/21:06）：…5260 的插件凭据为 wr_vid=; wr_skey=; wr_gid=xxx（vid/skey 空值）。
+// 用户在阅读窗口扫码后，prepareSession 判「窗口缺有效 skey」→ 把空值 Cookie 注入窗口 → 覆盖刚扫码的
+// 会话 → 页面一分钟内变未登录；页面重载后工具条也不再补注入（「问 DSH」弹条消失）。
+// 与账号是否一致无关：只要插件凭据是空壳，任何账号扫码后都会被覆盖。
+// 鉴别力：修复前 setCookie 会被调用（红）；修复后零注入（绿）。
+{
+  const mkShell = (port, mineCookie) => {
+    const dir = path.join(tmp, 'rw-shell-' + port);
+    fs.mkdirSync(dir, { recursive: true });
+    const FUT = Math.floor(Date.now() / 1000) + 30 * 86400; // 扫码会话：30 天有效期（与真机一致）
+    const c = { setCookies: [], methods: [], reports: [] };
+    const w = {
+      alive: false, targets: [], url: 'https://weread.qq.com/',
+      // 窗口里是用户刚扫码得到的**有效**会话（httpOnly、30 天）——绝不能被破坏
+      cookies: [
+        { name: 'wr_skey', value: 'SCANED_SKEY', expires: FUT, httpOnly: true },
+        { name: 'wr_vid', value: 'V1', expires: FUT, httpOnly: true },
+        { name: 'wr_rt', value: 'R'.repeat(28), expires: FUT, httpOnly: true },
+      ],
+    };
+    const t = () => ({ id: 'SH0', type: 'page', url: w.url, webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/SH0` });
+    const depsX = {
+      fetchJson: async (p, pathname) => {
+        if (!w.alive) throw new Error('ECONNREFUSED');
+        if (pathname === '/json/version') return { Browser: 'Chrome/147.0.0.0', webSocketDebuggerUrl: `ws://127.0.0.1:${p}/devtools/browser/b` };
+        if (pathname === '/json/list') return w.targets;
+        throw new Error('unexpected ' + pathname);
+      },
+      wsCall: async (wsUrl, commands) => commands.map((cmd, i) => {
+        c.methods.push(cmd.method);
+        if (cmd.method === 'Network.setCookie') c.setCookies.push(`${cmd.params.name}=${cmd.params.value}`);
+        return { id: i + 1, result:
+          cmd.method === 'Network.getCookies' ? { cookies: w.cookies }
+          : cmd.method === 'Browser.getWindowForTarget' ? { windowId: 91, bounds: { left: 0, top: 0, width: 800, height: 600 } }
+          : {} };
+      }),
+      launchProcess: async () => { w.alive = true; w.targets = [t()]; return { pid: 9300 }; },
+      execOpen: async () => ({ ok: false, error: 'no-open' }),
+      listPids: async () => [], killPid: () => {}, sleep: async () => {},
+      closeTarget: async () => { w.targets = []; },
+      chromeExecutable: () => '/fake/Chrome',
+      timeouts: { tier1: 20, tier2: 20, ready: 20, boundsWatch: 60_000, injectWatch: 60_000, jamWatch: 60_000, harvestWatch: 60_000 },
+      checkSession: async () => undefined, // 裁决网络异常（最保守分支——即便如此也不得注入空值）
+      onWindowSession: (s) => { c.reports.push(s); },
+    };
+    const rw = createReaderWindow({ stateDir: dir, log: () => {}, getCookies: () => mineCookie, deps: depsX });
+    return { c, w, rw };
+  };
+
+  // A) 真机形态：插件凭据 = 空壳（wr_vid=; wr_skey=; wr_gid=xxx），窗口 = 刚扫码的有效会话
+  {
+    const m = mkShell(47910, 'wr_vid=; wr_skey=; wr_gid=238966572');
+    const res = await m.rw.open(m.w.url);
+    ok(m.c.setCookies.length === 0, `空壳凭据：零注入（修复前注入 ${'wr_vid=/wr_skey=/wr_gid'} 覆盖扫码会话；实际 ${JSON.stringify(m.c.setCookies)}）`);
+    ok(!m.c.setCookies.some((x) => x === 'wr_skey=' || x === 'wr_vid='), '空壳凭据：绝无空值 wr_vid/wr_skey 写入窗口');
+    ok(res.ok === true, '空壳凭据：窗口照常打开（不因拒绝注入而失败）');
+    ok(!('loginExpired' in (res || {})), '空壳凭据：不误报 loginExpired（窗口里其实是有效会话）');
+    ok(m.c.reports.length === 1 && m.c.reports[0].wrSkey === 'SCANED_SKEY', '空壳凭据：反向同步上报窗内扫码会话（供宿主采纳救活插件，而非反过来破坏窗口）');
+    m.rw.dispose();
+  }
+
+  // B) 窗口没有任何会话 + 插件凭据是空壳 → 无可注入，也不写空值
+  {
+    const m = mkShell(47911, 'wr_vid=; wr_skey=');
+    m.w.cookies = [];
+    const res = await m.rw.open(m.w.url);
+    ok(res.ok === true && m.c.setCookies.length === 0, '空壳 + 空窗口：零注入（不往空 profile 写空值 Cookie）');
+    ok(!('loginExpired' in (res || {})), '空壳 + 空窗口：不误报过期（本就未登录，引导扫码而非「已过期」）');
+    m.rw.dispose();
+  }
+
+  // C) 对照：插件凭据正常 + 窗口无会话 → 照常注入（既有行为不被误伤）
+  {
+    const m = mkShell(47912, 'wr_vid=V1; wr_skey=GOOD_SKEY');
+    m.w.cookies = [];
+    const res = await m.rw.open(m.w.url);
+    ok(res.ok === true && m.c.setCookies.includes('wr_skey=GOOD_SKEY') && m.c.setCookies.includes('wr_vid=V1'), '对照：正常凭据 + 空窗口 → 照常注入（修复不误伤既有换血）');
+    m.rw.dispose();
+  }
+
+  // D) 半空壳：只有 skey 为空 → 同样拒绝（vid 在场不够，缺 skey 的会话不成立）
+  {
+    const m = mkShell(47913, 'wr_vid=V1; wr_skey=');
+    m.w.cookies = [];
+    await m.rw.open(m.w.url);
+    ok(m.c.setCookies.length === 0, '半空壳（仅 skey 空）：零注入');
+    m.rw.dispose();
+  }
+}
+
+// 13.78d v1.9.16 注入守护（服务级，真实定时器）：页面重载但 target id / URL 均未变 → 工具条必须补注入
+// 真机现象（2026-11-25）：扫码后「问 DSH」弹条不出现。页面因会话被破坏而自行重载/前端跳转，
+// target id 与 URL 都没变（都是首页）→ 守护的 `key === lastInjectKey` 判为「同一文档」→ 跳过注入
+// → 新文档里没有工具条脚本（#wr-readerbar / __wrAskDSH 均缺失，真机 CDP 实测）。
+// BOOTSTRAP_SCRIPT 自带幂等守卫（已存在工具条即 return），重复注入是安全的。
+// 鉴别力：修复前注入次数不增加（红）；修复后补注入（绿）。
+{
+  const dirJ = path.join(tmp, 'rw-inject-reload');
+  fs.mkdirSync(dirJ, { recursive: true });
+  const FUTJ = Math.floor(Date.now() / 1000) + 86400;
+  const c = { evaluates: 0, injectedUrls: [] };
+  // 页面世界：hasToolbar 模拟「当前文档里有没有工具条」；reload() 模拟页面自行重载（id/URL 不变）
+  const w = { alive: false, targets: [], url: 'https://weread.qq.com/', hasToolbar: false,
+    cookies: [{ name: 'wr_vid', value: 'V1', expires: FUTJ }, { name: 'wr_skey', value: 'S_SAME', expires: FUTJ }] };
+  const reload = () => { w.hasToolbar = false; }; // 新文档：工具条脚本不存在了
+  const depsX = {
+    fetchJson: async (p, pathname) => {
+      if (!w.alive) throw new Error('ECONNREFUSED');
+      if (pathname === '/json/version') return { Browser: 'Chrome/147.0.0.0', webSocketDebuggerUrl: `ws://127.0.0.1:${p}/devtools/browser/b` };
+      if (pathname === '/json/list') return w.targets;
+      throw new Error('unexpected ' + pathname);
+    },
+    wsCall: async (wsUrl, commands) => commands.map((cmd, i) => {
+      const expr = String(cmd.params?.expression ?? '');
+      if (cmd.method === 'Runtime.evaluate' && expr.includes('wr-readerbar') && expr.includes('inject')) { c.injectedUrls.push(w.url); w.hasToolbar = true; } // 注入脚本生效
+      return { id: i + 1, result:
+        cmd.method === 'Network.getCookies' ? { cookies: w.cookies }
+        : cmd.method === 'Browser.getWindowForTarget' ? { windowId: 101, bounds: { left: 0, top: 0, width: 800, height: 600 } }
+        : cmd.method === 'Runtime.evaluate' ? { result: { value: null } }
+        : {} };
+    }),
+    launchProcess: async () => { w.alive = true; w.targets = [{ id: 'JR0', type: 'page', url: w.url, webSocketDebuggerUrl: 'ws://127.0.0.1:47915/devtools/page/JR0' }]; return { pid: 9400 }; },
+    execOpen: async () => ({ ok: false, error: 'no-open' }),
+    listPids: async () => [], killPid: () => {}, sleep: async () => {},
+    closeTarget: async () => { w.targets = []; },
+    chromeExecutable: () => '/fake/Chrome',
+    timeouts: { tier1: 20, tier2: 20, ready: 20, boundsWatch: 60_000, injectWatch: 20, jamWatch: 60_000, harvestWatch: 60_000 },
+    checkSession: async () => true, onWindowSession: () => {},
+  };
+  const rw = createReaderWindow({ stateDir: dirJ, log: () => {}, getCookies: () => 'wr_vid=V1; wr_skey=S_SAME', deps: depsX });
+  try {
+    await rw.open(w.url);
+    await new Promise((r2) => setTimeout(r2, 80)); // 首次注入 + 守护记下 lastInjectKey
+    const firstInjections = c.injectedUrls.length;
+    ok(firstInjections >= 1 && w.hasToolbar === true, `前置：首次打开已注入工具条（${firstInjections} 次）`);
+    // 「页面自行重载」：target id 与 URL 都不变，只是新文档里没有工具条了
+    reload();
+    const targetIdBefore = w.targets[0].id;
+    let waited = 0;
+    // 等待窗口须覆盖「补注入限频 1.5s + 守护周期」——修复前永不补注入，所以给足窗口仍有鉴别力
+    while (!w.hasToolbar && waited < 4000) { await new Promise((r2) => setTimeout(r2, 20)); waited += 20; }
+    ok(w.targets[0].id === targetIdBefore, '前置：target id 未变（确是「同一目标」）');
+    ok(w.hasToolbar === true, `v1.9.16：页面重载（id/URL 未变）后工具条被补注入（${waited}ms 内；修复前守护判「同一文档」永不补注入 → 「问 DSH」弹条消失）`);
+    ok(waited < 2500, `v1.9.16：补注入足够快（${waited}ms，应 < 2.5s——用户几乎无感）`);
+    ok(c.injectedUrls.length > firstInjections, `v1.9.16：补注入确实发生（注入次数 ${firstInjections} → ${c.injectedUrls.length}）`);
+  } finally { rw.dispose(); }
+}
+
+// 13.78e v1.9.17 会话快照·记录侧（服务级）：窗口在场时回流守护滚动记录「最近一次见到的会话」
+// 关键约束：**窗内会话与插件同源时也必须记**。harvestNow 原本「同源即返回」（最常见状态），
+// 快照若挂在其后 will 长期不更新而过期——故刻意放在同源判定之前。
+// 鉴别力：同源场景下 snapshots 仍应有记录（若挂错位置则为 0）。
+{
+  const mkRec = (port, mineCookie) => {
+    const dir = path.join(tmp, 'rw-snaprec-' + port);
+    fs.mkdirSync(dir, { recursive: true });
+    const FUT = Math.floor(Date.now() / 1000) + 86400;
+    const c = { snapshots: [], reports: [] };
+    const w = { alive: false, targets: [], url: 'https://weread.qq.com/web/reader/snap',
+      cookies: [{ name: 'wr_vid', value: 'V1', expires: FUT }, { name: 'wr_skey', value: 'S_WIN', expires: FUT }] };
+    const t = () => ({ id: 'SR0', type: 'page', url: w.url, webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/SR0` });
+    const depsX = {
+      fetchJson: async (p, pathname) => {
+        if (!w.alive) throw new Error('ECONNREFUSED');
+        if (pathname === '/json/version') return { Browser: 'Chrome/147.0.0.0', webSocketDebuggerUrl: `ws://127.0.0.1:${p}/devtools/browser/b` };
+        if (pathname === '/json/list') return w.targets;
+        throw new Error('unexpected ' + pathname);
+      },
+      wsCall: async (wsUrl, commands) => commands.map((cmd, i) => ({ id: i + 1, result:
+        cmd.method === 'Network.getCookies' ? { cookies: w.cookies }
+        : cmd.method === 'Browser.getWindowForTarget' ? { windowId: 131, bounds: { left: 0, top: 0, width: 800, height: 600 } } : {} })),
+      launchProcess: async () => { w.alive = true; w.targets = [t()]; return { pid: 9700 }; },
+      execOpen: async () => ({ ok: false, error: 'no-open' }), listPids: async () => [], killPid: () => {}, sleep: async () => {},
+      closeTarget: async () => { w.targets = []; }, chromeExecutable: () => '/fake/Chrome',
+      timeouts: { tier1: 20, tier2: 20, ready: 20, boundsWatch: 60_000, injectWatch: 60_000, jamWatch: 60_000 },
+      checkSession: async () => true,
+      onWindowSession: (s) => { c.reports.push(s); },
+      saveSessionSnapshot: (snap) => { c.snapshots.push(snap); },
+    };
+    const rw = createReaderWindow({ stateDir: dir, log: () => {}, getCookies: () => mineCookie, deps: depsX });
+    return { c, w, rw };
+  };
+
+  // A) 窗内会话与插件**同源**（最常见状态）→ 不上报，但快照必须记
+  {
+    const m = mkRec(47920, 'wr_vid=V1; wr_skey=S_WIN');
+    await m.rw.open(m.w.url); // 开窗：拉起实例 + 写 state 端口（harvestNow 首行即检查端口，不开窗则早退）
+    m.c.snapshots.length = 0; m.c.reports.length = 0; // 清掉开窗路径产生的记录，只看 harvestNow
+    const r = await m.rw._internal.harvestNow();
+    ok(r.ok === false && m.c.reports.length === 0, '同源：不上报（既有行为不变）');
+    ok(m.c.snapshots.length === 1 && m.c.snapshots[0].wrSkey === 'S_WIN' && m.c.snapshots[0].wrVid === 'V1', `同源时快照**仍**被记录（${m.c.snapshots.length} 次）——挂在「同源即返回」之前`);
+    m.rw.dispose();
+  }
+
+  // B) 不同源 → 既上报也记快照（快照取窗内值）
+  {
+    const m = mkRec(47921, 'wr_vid=V1; wr_skey=S_OLD');
+    await m.rw.open(m.w.url); // 开窗：拉起实例 + 写 state 端口（harvestNow 首行即检查端口，不开窗则早退）
+    m.c.snapshots.length = 0; m.c.reports.length = 0; // 清掉开窗路径产生的记录，只看 harvestNow
+    const r = await m.rw._internal.harvestNow();
+    ok(r.ok === true && m.c.reports.length === 1, '不同源：上报宿主（既有行为）');
+    ok(m.c.snapshots.length === 1 && m.c.snapshots[0].wrSkey === 'S_WIN', '不同源：快照记窗内会话');
+    m.rw.dispose();
+  }
+
+  // C) 窗内会话日期已死 → 不记（不把死值当快照）
+  {
+    const m = mkRec(47922, 'wr_vid=V1; wr_skey=S_OLD');
+    await m.rw.open(m.w.url); // 开窗：拉起实例 + 写 state 端口（harvestNow 首行即检查端口，不开窗则早退）
+    m.c.snapshots.length = 0; m.c.reports.length = 0; // 清掉开窗路径产生的记录，只看 harvestNow
+    const PAST = Math.floor(Date.now() / 1000) - 3600; // 开窗后把窗内会话改成「日期已死」
+    m.w.cookies = [{ name: 'wr_vid', value: 'V1', expires: PAST }, { name: 'wr_skey', value: 'S_DEADWIN', expires: PAST }];
+    m.c.snapshots.length = 0; // 清掉开窗时（会话尚有效）记下的那一笔
+    await m.rw._internal.harvestNow();
+    ok(m.c.snapshots.length === 0, '窗内会话日期已死 → 不记快照（不回流死值）');
+    m.rw.dispose();
+  }
+
+  // D) 窗内无会话（未登录）→ 不记、不写空壳
+  {
+    const m = mkRec(47923, undefined);
+    await m.rw.open(m.w.url); // 开窗：拉起实例 + 写 state 端口（harvestNow 首行即检查端口，不开窗则早退）
+    m.c.snapshots.length = 0; m.c.reports.length = 0; // 清掉开窗路径产生的记录，只看 harvestNow
+    m.w.cookies = []; // 开窗后清空窗内会话（模拟未登录）
+    m.c.snapshots.length = 0;
+    await m.rw._internal.harvestNow();
+    ok(m.c.snapshots.length === 0, '窗内无会话 → 不记快照（不写空壳）');
+    m.rw.dispose();
+  }
+
+  // E) 宿主未注入 saveSessionSnapshot（可选依赖）→ 窗口在场、不同源时回流照常上报，不抛错
+  //    （首版此场景写错：delete 返回对象上的 _internal 对 readerWindow 内部毫无影响，且并未真正测到「未注入」）
+  {
+    const dirE = path.join(tmp, 'rw-snaprec-nofn'); fs.mkdirSync(dirE, { recursive: true });
+    const FUTE = Math.floor(Date.now() / 1000) + 86400;
+    const cE = { reports: [] };
+    const wE = { alive: false, targets: [], url: 'https://weread.qq.com/web/reader/nofn',
+      cookies: [{ name: 'wr_vid', value: 'V1', expires: FUTE }, { name: 'wr_skey', value: 'S_WIN', expires: FUTE }] };
+    const depsE = {
+      fetchJson: async (p, pathname) => {
+        if (!wE.alive) throw new Error('ECONNREFUSED');
+        if (pathname === '/json/version') return { Browser: 'Chrome/147.0.0.0', webSocketDebuggerUrl: `ws://127.0.0.1:${p}/devtools/browser/b` };
+        if (pathname === '/json/list') return wE.targets;
+        throw new Error('unexpected ' + pathname);
+      },
+      wsCall: async (wsUrl, commands) => commands.map((cmd, i) => ({ id: i + 1, result:
+        cmd.method === 'Network.getCookies' ? { cookies: wE.cookies }
+        : cmd.method === 'Browser.getWindowForTarget' ? { windowId: 141, bounds: { left: 0, top: 0, width: 800, height: 600 } } : {} })),
+      launchProcess: async () => { wE.alive = true; wE.targets = [{ id: 'NF0', type: 'page', url: wE.url, webSocketDebuggerUrl: 'ws://127.0.0.1:47925/devtools/page/NF0' }]; return { pid: 9800 }; },
+      execOpen: async () => ({ ok: false, error: 'no-open' }), listPids: async () => [], killPid: () => {}, sleep: async () => {},
+      closeTarget: async () => { wE.targets = []; }, chromeExecutable: () => '/fake/Chrome',
+      timeouts: { tier1: 20, tier2: 20, ready: 20, boundsWatch: 60_000, injectWatch: 60_000, jamWatch: 60_000 },
+      checkSession: async () => true,
+      onWindowSession: (x) => { cE.reports.push(x); },
+      // 刻意不提供 saveSessionSnapshot
+    };
+    const rwE = createReaderWindow({ stateDir: dirE, log: () => {}, getCookies: () => 'wr_vid=V1; wr_skey=S_OLD', deps: depsE });
+    await rwE.open(wE.url); // 窗口在场（否则 harvestNow 早退，测不到目标路径）
+    cE.reports.length = 0;
+    let threw = false; let rE = null;
+    try { rE = await rwE._internal.harvestNow(); } catch { threw = true; }
+    ok(!threw && rE?.ok === true && cE.reports.length === 1, 'E：未注入 saveSessionSnapshot → 回流照常上报、不抛错（可选依赖）');
+    rwE.dispose();
+  }
+}
+
+// 13.78f v1.9.18 窗口位置记忆·关窗时刻修正（服务级）：修「重开后大小/位置与最后一次关闭时有偏差」
+// 真机现象 + 隔离复现（2026-11-25，真实 Chrome）：位置靠 5s 轮询守护记忆，用户点红叉关窗时无从拦截，
+// 关窗前最后 5s 内的移动/缩放全部丢失 → 重开回到上一次轮询到的旧值。
+// 修法：页面 pagehide 把窗口几何写入 localStorage；新窗口打开后读出，比轮询记忆新且位置不同则修正。
+{
+  const vm = await import('node:vm');
+  const { BOOTSTRAP_SCRIPT } = createReaderWindow({ stateDir: path.join(tmp, 'rw-lc-dummy'), log: () => {}, deps: {} })._internal;
+
+  // ---- 页面侧钩子（从运行时脚本里取出那一行，在 vm 沙箱里验证行为）----
+  {
+    ok(BOOTSTRAP_SCRIPT.indexOf('__wrBoundsHook') < BOOTSTRAP_SCRIPT.indexOf('(function inject()'), '钩子位于 hostname 守卫之前（阅读窗口内任何站点都记）');
+    const hookLine = BOOTSTRAP_SCRIPT.split('\n').find((l) => l.includes('__wrBoundsHook'));
+    ok(/if\(!window\.__wrBoundsArm\)return/.test(hookLine), '钩子默认**未上膛**：pagehide 不写任何东西');
+    ok(hookLine.includes("addEventListener('pagehide'") && hookLine.includes("'wr:lastBounds'"), 'pagehide 触发，写入 wr:lastBounds');
+    const mkSb = () => { const ls = {}; const store = {}; return { ls, store, sb: { window: { screenX: 90, screenY: 120, outerWidth: 1000, outerHeight: 700, addEventListener: (ev, fn) => { ls[ev] = fn; } }, document: {}, localStorage: { setItem: (k, v) => { store[k] = v; }, getItem: (k) => store[k] ?? null }, JSON, Date } }; };
+    const a = mkSb(); vm.runInNewContext(hookLine, a.sb);
+    a.ls.pagehide(); ok(Object.keys(a.store).length === 0, '未上膛时 pagehide：不写记录');
+    a.sb.window.__wrBoundsArm = 1; a.ls.pagehide();
+    const rec = JSON.parse(a.store['wr:lastBounds']);
+    ok(rec.x === 90 && rec.y === 120 && rec.w === 1000 && rec.h === 700 && rec.t > 0, '上膛后 pagehide：记录当前窗口几何（与 CDP bounds 同单位，真机实测逐项相等）');
+    let n = 0; const b = mkSb(); b.sb.window.addEventListener = () => { n += 1; };
+    vm.runInNewContext(hookLine, b.sb); vm.runInNewContext(hookLine, b.sb);
+    ok(n === 1, '同一文档重复注入只挂一次监听（幂等）');
+  }
+
+  // ---- 宿主侧：伪 CDP 世界 ----
+  const mkLc = (port, { mem, ls = '0', honorSet = true, timeouts = {} } = {}) => {
+    const dir = path.join(tmp, 'rw-lastclose-' + port);
+    fs.mkdirSync(dir, { recursive: true });
+    const url = `https://weread.qq.com/web/reader/lc${port}`;
+    const state = { lastUrl: url };
+    if (mem) state.bounds = mem;
+    fs.writeFileSync(path.join(dir, 'reader-window.json'), JSON.stringify(state));
+    const c = { setBounds: [], injects: [], armed: 0, reads: 0 };
+    const w = { alive: false, targets: [], url, probeFail: 0,
+      bounds: { left: 11, top: 22, width: 1240, height: 900, windowState: 'normal' } }; // Chrome 自己的摆位
+    const t = (id = 'LC0', u = url) => ({ id, type: 'page', url: u, webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/${id}` });
+    const depsX = {
+      fetchJson: async (p, pathname) => {
+        // 实例活着即应答任意端口（与其它伪世界一致）：pickPort 从区间起点选首个空置端口，不等于 wsCall 桩里写的端口
+        if (!w.alive) throw new Error('ECONNREFUSED');
+        if (pathname === '/json/version') return { Browser: 'Chrome/147.0.0.0', webSocketDebuggerUrl: `ws://127.0.0.1:${p}/devtools/browser/b` };
+        if (pathname === '/json/list') return w.targets;
+        throw new Error('unexpected ' + pathname);
+      },
+      wsCall: async (wsUrl, commands) => {
+        const out = [];
+        for (const cmd of commands) {
+          const expr = String(cmd.params?.expression ?? '');
+          const r = (result) => out.push({ id: out.length + 1, result });
+          if (cmd.method === 'Runtime.evaluate' && expr === '1' && w.probeFail > 0) { w.probeFail -= 1; throw new Error('evaluate timeout'); }
+          // 识别顺序有讲究：工具条注入脚本自带 localStorage.getItem(POS_KEY)（工具条位置记忆），
+          // 必须先认注入脚本，再按专门键名认「读关窗记录」——否则注入会被误计为读取。
+          if (cmd.method === 'Runtime.evaluate' && expr.includes('window.close = wrClose')) { c.injects.push(expr.includes('__wrBoundsArm=1')); r({ result: { value: undefined } }); continue; }
+          if (cmd.method === 'Runtime.evaluate' && expr.includes('getItem') && expr.includes('wr:lastBounds')) { c.reads += 1; r({ result: { type: 'string', value: typeof w.ls === 'function' ? w.ls() : w.ls } }); continue; }
+          if (cmd.method === 'Runtime.evaluate' && expr.includes('__wrBoundsArm=1')) { c.armed += 1; r({ result: { value: 1 } }); continue; }
+          if (cmd.method === 'Browser.getWindowForTarget') { r({ windowId: 7, bounds: { ...w.bounds } }); continue; }
+          if (cmd.method === 'Browser.setWindowBounds') { c.setBounds.push(cmd.params.bounds); if (honorSet) w.bounds = { ...cmd.params.bounds }; r({}); continue; }
+          r(cmd.method === 'Network.getCookies' ? { cookies: [] } : {});
+        }
+        return out;
+      },
+      launchProcess: async () => { w.alive = true; w.targets = [t()]; return { pid: 9900 + (port % 100) }; },
+      execOpen: async () => ({ ok: false, error: 'no-open' }), listPids: async () => [], killPid: () => {}, sleep: async () => {},
+      closeTarget: async () => { w.targets = []; }, chromeExecutable: () => '/fake/Chrome',
+      timeouts: { tier1: 20, tier2: 20, ready: 20, boundsWatch: 60_000, injectWatch: 20, jamWatch: 60_000, harvestWatch: 60_000, ...timeouts },
+    };
+    const rw = createReaderWindow({ stateDir: dir, log: () => {}, getCookies: () => undefined, deps: depsX });
+    w.ls = ls;
+    const st = () => JSON.parse(fs.readFileSync(path.join(dir, 'reader-window.json'), 'utf8'));
+    return { c, w, rw, st, url, t, port, dir };
+  };
+  const wait = (ms) => new Promise((r2) => setTimeout(r2, ms));
+  const now = () => Date.now();
+  const MEM = { left: 200, top: 150, width: 700, height: 500, windowState: 'normal' };
+  const REC = { left: 90, top: 120, width: 1000, height: 700 };
+  const rec = (at, geo = REC) => '1' + JSON.stringify({ x: geo.left, y: geo.top, w: geo.width, h: geo.height, t: at });
+
+  // A) 真机故障形态：轮询记忆滞后，关窗记录更新且位置不同 → 修正到关窗时的几何
+  {
+    const T = now();
+    const m = mkLc(47931, { mem: { ...MEM, at: T - 60_000 }, ls: rec(T - 2000) });
+    await m.rw.open(m.url); await wait(150);
+    ok(m.c.setBounds.length === 2 && m.c.setBounds[1].left === 90 && m.c.setBounds[1].top === 120 && m.c.setBounds[1].width === 1000 && m.c.setBounds[1].height === 700,
+      `A：先按轮询记忆恢复，再用关窗记录修正到关窗时的位置（setWindowBounds × ${m.c.setBounds.length}）`);
+    const sb = m.st().bounds;
+    ok(sb.left === 90 && sb.top === 120 && sb.width === 1000 && sb.height === 700 && sb.at >= T - 2000, 'A：记忆同步为关窗时几何（带时间戳）');
+    ok(m.c.armed >= 1, 'A：处理完后给页面钩子上膛（之后关窗才有记录）');
+    m.rw.dispose();
+  }
+
+  // B) 关窗记录不比轮询记忆新 → 不修正（即使位置不同）
+  for (const [label, recAt] of [['相同', -60_000], ['更旧', -120_000]]) {
+    const T = now();
+    const m = mkLc(47932, { mem: { ...MEM, at: T - 60_000 }, ls: rec(T + recAt) });
+    await m.rw.open(m.url); await wait(120);
+    ok(m.c.setBounds.length === 1 && m.st().bounds.left === 200, `B（记录${label}）：不修正——轮询记忆已是最新`);
+    m.rw.dispose();
+  }
+
+  // C) 窗口已不在刚恢复的位置（用户已挪动 / Chrome 另有安排）→ 不抢
+  {
+    const T = now();
+    const m = mkLc(47933, { mem: { ...MEM, at: T - 60_000 }, ls: rec(T - 2000), honorSet: false });
+    await m.rw.open(m.url); await wait(120);
+    ok(m.c.setBounds.length === 1, 'C：窗口不在恢复位置时不抢（不覆盖用户已做的调整）');
+    m.rw.dispose();
+  }
+
+  // D) 记忆是全屏/最大化 → 语义不同，不做关窗记录修正
+  {
+    const T = now();
+    const m = mkLc(47934, { mem: { ...MEM, windowState: 'fullscreen', at: T - 60_000 }, ls: rec(T - 2000) });
+    await m.rw.open(m.url); await wait(120);
+    ok(m.c.setBounds.length === 1 && m.c.setBounds[0].windowState === 'fullscreen' && !('left' in m.c.setBounds[0]), 'D：全屏记忆 → 只恢复全屏，不用关窗记录改位置');
+    m.rw.dispose();
+  }
+
+  // E) 无关窗记录 → 不修正，正常上膛；上膛时序：首屏注入未上膛，处理完后的新文档注入才带膛
+  {
+    const m = mkLc(47935, { mem: { ...MEM, at: now() - 60_000 }, ls: '0' });
+    await m.rw.open(m.url); await wait(100);
+    ok(m.c.reads === 1 && m.c.setBounds.length === 1 && m.c.armed === 1, 'E：无记录 → 读一次、不修正、上膛一次');
+    ok(m.c.injects.length >= 1 && m.c.injects[0] === false, 'E：首屏注入时**未**上膛（防止换血重载用旧位置覆盖关窗记录）');
+    m.w.targets = [m.t('LC1', m.url + '#next')]; await wait(1000); // 新文档 → 注入守护补注入（sharedProbe 成功缓存 700ms，须等缓存过期才看得到新 targets）
+    ok(m.c.injects.includes(true), 'E：处理完后的新文档注入才带膛');
+    m.rw.dispose();
+  }
+
+  // F) 文档未就绪（源未提交）→ 在注入守护轮次重试，读到即停
+  {
+    let n = 0;
+    const m = mkLc(47936, { mem: { ...MEM, at: now() - 60_000 }, ls: () => (++n <= 3 ? '' : '0') });
+    await m.rw.open(m.url); await wait(150);
+    const r1 = m.c.reads; await wait(150);
+    ok(r1 === 4 && m.c.reads === 4 && m.c.armed === 1 && m.c.setBounds.length === 1, `F：未就绪重试到就绪为止（共读 ${m.c.reads} 次：3 次未就绪 + 1 次就绪），之后不再读`);
+    m.rw.dispose();
+  }
+
+  // G) 一直读不到（非 http 源等）→ 有界放弃（≤8 次），回到纯轮询记忆；仍上膛
+  {
+    const m = mkLc(47937, { mem: { ...MEM, at: now() - 60_000 }, ls: '' });
+    await m.rw.open(m.url); await wait(400);
+    ok(m.c.reads === 8 && m.c.armed === 1 && m.c.setBounds.length === 1, `G：久等不到 → 至多 8 次（实际 ${m.c.reads}）后放弃，不无限重试`);
+    m.rw.dispose();
+  }
+
+  // H) 残缺/损坏的记录 → 不当几何用、不抛错
+  {
+    const m = mkLc(47938, { mem: { ...MEM, at: now() - 60_000 }, ls: '1' + JSON.stringify({ x: 'a', t: 1 }) });
+    await m.rw.open(m.url); await wait(120);
+    ok(m.c.setBounds.length === 1 && m.st().bounds.left === 200, 'H：残缺记录不修正、不抛错');
+    m.rw.dispose();
+  }
+
+  // I) 用户正在用的窗口（导航复用）→ 不存在「重开位置」，不读关窗记录、不动窗口
+  {
+    const m = mkLc(47939, { mem: { ...MEM, at: now() - 60_000 }, ls: rec(now()) });
+    m.w.alive = true; m.w.targets = [m.t()];
+    fs.writeFileSync(path.join(m.dir, 'reader-window.json'), JSON.stringify({ port: m.port, lastUrl: m.url, bounds: m.st().bounds }));
+    const r = await m.rw.open(m.url); await wait(120);
+    ok(r.ok && r.mode === 'reader-window' && m.c.reads === 0 && m.c.setBounds.length === 0, 'I：窗口在场时导航复用——不读关窗记录、不动窗口');
+    m.rw.dispose();
+  }
+
+  // J) 时间戳语义：几何不变不刷新 at、不写盘；变了才记新时刻
+  {
+    const T = now();
+    const m = mkLc(47940, { mem: { ...MEM, at: T - 60_000 }, ls: '0', timeouts: { boundsWatch: 40 } });
+    await m.rw.open(m.url); await wait(130);
+    ok(m.st().bounds.at === T - 60_000, 'J：开窗后按记忆恢复并捕获——几何未变，at 保持（否则旧记忆会被标成新鲜的，修正永不触发）');
+    m.w.bounds = { left: 5, top: 6, width: 640, height: 480, windowState: 'normal' };
+    await wait(130);
+    const at1 = m.st().bounds.at;
+    ok(m.st().bounds.left === 5 && at1 >= T, 'J：窗口被移动 → 守护记下新几何与新时刻');
+    await wait(150);
+    ok(m.st().bounds.at === at1, 'J：此后几何不变 → at 不再刷新（不每轮写盘）');
+    m.rw.dispose();
+  }
+
+  // K) 自愈重开（渲染卡死 → 关页重开）也要还原记忆位置——原路径漏了，还把 Chrome 的摆位写进记忆
+  {
+    const T = now();
+    const m = mkLc(47941, { mem: { ...MEM, at: T - 60_000 }, ls: '0', timeouts: { jamWatch: 20 } });
+    await m.rw.open(m.url); await wait(120);
+    const before = m.c.setBounds.length;
+    m.w.probeFail = 2; await wait(700); // 连续 2 击 → 自愈：closeTarget → 重开
+    const last = m.c.setBounds[m.c.setBounds.length - 1];
+    ok(m.c.setBounds.length === before + 1 && last.left === 200 && last.top === 150 && last.width === 700 && last.height === 500,
+      `K：自愈重开的新窗口还原到记忆位置（自愈前 ${before} 次 setWindowBounds → 之后 ${m.c.setBounds.length} 次）`);
+    m.rw.dispose();
+  }
+}
+
 // 13.78b v1.9.0 B1/A1/A2（服务级）：同值死会话提前归因 + 裁决缓存 + 登录推窗 + 会话回流守护
 {
   const mkSess2 = (port) => {
@@ -2489,6 +3060,155 @@ ok(r.payload.gateway && r.payload.gateway.enabled === false && r.payload.gateway
     globalThis.fetch = origFetchR;
   }
 }
+// 13.79h v1.9.16 Keychain 补水（apply 级，keychainDeps 注入假钥匙串）：空壳凭据应被 Keychain 里的好凭据替换
+// 真机现场（2026-11-25）：…5260 的 secrets.json 是空壳 wr_vid=; wr_skey=; wr_gid=xxx，而 Keychain 里
+// 存着**好的** wr_vid/wr_skey。原补水条件 `!store.getCookies(id)`——空壳是非空字符串 → 被判「有凭据」
+// → 跳过恢复 → 坏凭据长期得不到修复。鉴别力：修复前文件仍是空壳（红）；修复后换成好凭据（绿）。
+{
+  const mkKc = (tag, fileCookie, kcCookie = 'wr_vid=V1; wr_skey=KC_GOOD_SKEY') => {
+    const reg = { web: [], tools: [] };
+    const ctx = { effect: (fn) => { fn(); return () => {}; }, inject: () => () => {}, webServer: { register: (x) => reg.web.push(x) }, tools: { register: (x) => reg.tools.push(x) } };
+    const dir = path.join(tmp, 'state-kc-' + tag);
+    fs.mkdirSync(dir, { recursive: true });
+    const secrets = {};
+    if (fileCookie !== null) secrets['weread.vscode.U1.cookies'] = fileCookie;
+    fs.writeFileSync(path.join(dir, 'secrets.json'), JSON.stringify(secrets));
+    fs.writeFileSync(path.join(dir, 'meta.json'), JSON.stringify({ version: 1, activeAccountId: 'U1', accounts: [{ accountId: 'U1', userId: 'U1', wrVid: 'V1', displayName: 'KC账号', createdAt: 1, lastUsedAt: 1 }] }));
+    // 不预置 prefs.keychain=false（那会关掉镜像）；keychainDeps 在场时忽略平台判定
+    const kc = { finds: [], writes: [] };
+    // 钥匙串内容由场景指定：默认是真机形态（U1 有一份**好的**凭据）；null=钥匙串里也没有
+    const kcStore = kcCookie === null ? {} : { 'dsh-weread|U1': kcCookie };
+    const keychainDeps = {
+      run: async (args) => {
+        const [verb, flag, service, , account] = args;
+        if (verb === 'find-generic-password') { kc.finds.push(`${service}|${account}`); return kcStore[`${service}|${account}`] ?? null; }
+        if (verb === 'add-generic-password') { kc.writes.push(`${service}|${account}`); return ''; }
+        if (verb === 'delete-generic-password') return '';
+        return null;
+      },
+    };
+    return { reg, ctx, dir, kc, keychainDeps };
+  };
+  const cookieOf = (dir) => JSON.parse(fs.readFileSync(path.join(dir, 'secrets.json'), 'utf8'))['weread.vscode.U1.cookies'];
+
+  // A) 真机形态：文件=空壳，钥匙串=好凭据 → 启动补水应把空壳替换为好凭据
+  {
+    const m = mkKc('a', 'wr_vid=; wr_skey=; wr_gid=238966572');
+    let dispose = null;
+    try {
+      dispose = apply(m.ctx, { stateDir: m.dir, outputPath: '', apiToken: SMOKE_TOKEN, keychainDeps: m.keychainDeps, getAccountId: () => '' });
+      await new Promise((r2) => setTimeout(r2, 250)); // 补水是异步链
+      ok(m.kc.finds.includes('dsh-weread|U1'), `A：空壳凭据 → 触发向 Keychain 查询（finds=${JSON.stringify(m.kc.finds)}）`);
+      ok(cookieOf(m.dir) === 'wr_vid=V1; wr_skey=KC_GOOD_SKEY', `A：文件凭据被替换为 Keychain 里的好凭据（实际：${cookieOf(m.dir)}）`);
+    } finally { try { dispose?.(); } catch { /* ignore */ } }
+  }
+
+  // B) 文件里已是完整有效凭据 → 不动它（不被 Keychain 的旧值覆盖）
+  {
+    const m = mkKc('b', 'wr_vid=V1; wr_skey=FILE_NEWER_SKEY');
+    let dispose = null;
+    try {
+      dispose = apply(m.ctx, { stateDir: m.dir, outputPath: '', apiToken: SMOKE_TOKEN, keychainDeps: m.keychainDeps, getAccountId: () => '' });
+      await new Promise((r2) => setTimeout(r2, 250));
+      ok(!m.kc.finds.includes('dsh-weread|U1'), 'B：文件凭据完整有效 → 不查询 Keychain（不被旧值覆盖）');
+      ok(cookieOf(m.dir) === 'wr_vid=V1; wr_skey=FILE_NEWER_SKEY', 'B：文件凭据原样保留');
+    } finally { try { dispose?.(); } catch { /* ignore */ } }
+  }
+
+  // C) 文件无凭据 + 钥匙串也无 → 保持未登录（不凭空造出空壳、不把登录态置真）
+  {
+    const m = mkKc('c', null, null); // 文件无凭据 + 钥匙串也无
+    let dispose = null;
+    try {
+      dispose = apply(m.ctx, { stateDir: m.dir, outputPath: '', apiToken: SMOKE_TOKEN, keychainDeps: m.keychainDeps, getAccountId: () => '' });
+      const route = m.reg.web.find((x) => x.path === '/weread');
+      await call('GET', '/weread/api/state', null, route, 'Bearer seed-kc');
+      const auth = 'Bearer ' + JSON.parse(fs.readFileSync(path.join(m.dir, 'endpoint.json'), 'utf8')).token;
+      await new Promise((r2) => setTimeout(r2, 250));
+      const st = (await call('GET', '/weread/api/state', undefined, route, auth)).payload;
+      ok(cookieOf(m.dir) === undefined, 'C：两边都无凭据 → 文件保持无凭据（不造空壳）');
+      ok(st?.loggedIn !== true, `C：两边都无凭据 → 未登录（补水链不得把登录态置真；实际 loggedIn=${st?.loggedIn}）`);
+    } finally { try { dispose?.(); } catch { /* ignore */ } }
+  }
+
+  // D) 补水恢复出**空壳**（钥匙串里也是坏的）→ 不得当作有效凭据、不得置登录态为真
+  {
+    const m = mkKc('d', null, 'wr_vid=; wr_skey='); // 文件无凭据 + 钥匙串里也是空壳
+    let dispose = null;
+    try {
+      dispose = apply(m.ctx, { stateDir: m.dir, outputPath: '', apiToken: SMOKE_TOKEN, keychainDeps: m.keychainDeps, getAccountId: () => '' });
+      const route = m.reg.web.find((x) => x.path === '/weread');
+      await call('GET', '/weread/api/state', null, route, 'Bearer seed-kc');
+      const auth = 'Bearer ' + JSON.parse(fs.readFileSync(path.join(m.dir, 'endpoint.json'), 'utf8')).token;
+      await new Promise((r2) => setTimeout(r2, 250));
+      const st = (await call('GET', '/weread/api/state', undefined, route, auth)).payload;
+      const ck = cookieOf(m.dir);
+      ok(!ck || !/wr_skey=;/.test(ck), `D：钥匙串里也是空壳 → 不落盘空壳（实际：${ck}）`);
+      ok(st?.loggedIn !== true, `D：空壳不得点亮登录态（实际 loggedIn=${st?.loggedIn}）`);
+    } finally { try { dispose?.(); } catch { /* ignore */ } }
+  }
+}
+
+
+
+// 13.79e v1.9.14 登录态同步延迟源 B（服务级，真实定时器）：窗内扫码登录 → 文档变化 → 即时回流
+// 真机现象「阅读窗口已登录，但登录弹窗同步登录态有延迟」。根因：反向同步只在开书/导航事件
+// 上报一次，之后仅靠 A2 回流守护兜底，周期 600s。用户在已打开的窗口里扫码登录（不触发开书），
+// 插件最长要等 10min 才知道。修复：复用注入守护既有的 1.5s「文档变化」事件触发一次回流
+// （扫码成功必然导航/重载），零新增轮询。
+// 鉴别力：本用例不手动调 harvestNow，只推进真实定时器——修复前 reports 恒 0（红），修复后 >0（绿）。
+{
+  const dirV = path.join(tmp, 'rw-sess-v1914');
+  fs.mkdirSync(dirV, { recursive: true });
+  const FUTV = Math.floor(Date.now() / 1000) + 86400;
+  const cV = { reports: [] };
+  const wV = { alive: false, targets: [], url: 'https://weread.qq.com/web/reader/v14', cookies: [] };
+  const depsV = {
+    fetchJson: async (p, pathname) => {
+      if (!wV.alive) throw new Error('ECONNREFUSED');
+      if (pathname === '/json/version') return { Browser: 'Chrome/147.0.0.0', webSocketDebuggerUrl: `ws://127.0.0.1:${p}/devtools/browser/b` };
+      if (pathname === '/json/list') return wV.targets;
+      throw new Error('unexpected ' + pathname);
+    },
+    wsCall: async (wsUrl, commands) => commands.map((cmd, i) => ({ id: i + 1, result:
+      cmd.method === 'Network.getCookies' ? { cookies: wV.cookies }
+      : cmd.method === 'Browser.getWindowForTarget' ? { windowId: 51, bounds: { left: 0, top: 0, width: 800, height: 600 } }
+      : {} })),
+    launchProcess: async () => { wV.alive = true; return { pid: 7800 }; },
+    execOpen: async () => ({ ok: false, error: 'no-open' }),
+    listPids: async () => [], killPid: () => {}, sleep: async () => {},
+    closeTarget: async () => { wV.targets = []; },
+    chromeExecutable: () => '/fake/Chrome',
+    // 真实短周期定时器：注入守护 15ms（生产 1500ms）；回流守护留 600s 生产值——
+    // 若修复依赖的仍是 600s 守护，本用例在超时窗口内必然观测不到上报
+    timeouts: { tier1: 20, tier2: 20, ready: 20, boundsWatch: 60_000, injectWatch: 15, jamWatch: 60_000 },
+    onWindowSession: (s) => { cV.reports.push(s); },
+  };
+  const rwV = createReaderWindow({ stateDir: dirV, log: () => {}, getCookies: () => undefined, deps: depsV }); // 插件无凭据（未登录）
+  try {
+    // 世界：窗口已开、未登录（无 weread Cookie）
+    wV.alive = true;
+    wV.targets = [{ id: 'V0', type: 'page', url: 'https://weread.qq.com/', webSocketDebuggerUrl: 'ws://127.0.0.1:47896/devtools/page/V0' }];
+    fs.writeFileSync(path.join(dirV, 'reader-window.json'), JSON.stringify({ port: 47896, lastUrl: 'https://weread.qq.com/' }));
+    // 走一次 open 让守护起来（窗口在场 → navigateExisting 路径；此时尚未登录，无可上报会话）
+    await rwV.open('https://weread.qq.com/');
+    await new Promise((r2) => setTimeout(r2, 60)); // 让注入守护完成首个文档的注入（记 lastInjectKey）
+    cV.reports.length = 0;
+
+    // 「用户在窗内扫码登录」：服务端下发会话 Cookie + 页面导航到书页（文档变化）
+    wV.cookies = [{ name: 'wr_vid', value: 'V1', expires: FUTV }, { name: 'wr_skey', value: 'S_SCAN', expires: FUTV }];
+    wV.targets = [{ id: 'V0', type: 'page', url: 'https://weread.qq.com/web/reader/abc123', webSocketDebuggerUrl: 'ws://127.0.0.1:47896/devtools/page/V0' }];
+
+    // 最多等 1s（≈ 60 个注入守护 tick，远小于 600s 守护周期）看是否自动回流
+    let waited = 0;
+    while (cV.reports.length === 0 && waited < 1000) { await new Promise((r2) => setTimeout(r2, 20)); waited += 20; }
+    ok(cV.reports.length >= 1, `v1.9.14 源B：窗内扫码登录后自动回流（${waited}ms 内；修复前需等 600s 守护）`);
+    ok(cV.reports[0]?.wrSkey === 'S_SCAN' && cV.reports[0]?.wrVid === 'V1', 'v1.9.14 源B：回流的是窗内新会话（供宿主采纳 → 登录态点亮）');
+    ok(!cV.reports.some((r2) => false) && cV.reports.length <= 2, `v1.9.14 源B：单次文档变化只回流一两次，不重复轰炸（${cV.reports.length} 次）`);
+  } finally {
+    rwV.dispose();
+  }
+}
 
 // 13.79c v1.9.3 软取消（sync 级）：书边界检查点 + 在飞书自然完成 + cancelled 终态 + 互斥释放
 {
@@ -2677,6 +3397,539 @@ ok(r.payload.gateway && r.payload.gateway.enabled === false && r.payload.gateway
     await new Promise((r2) => setTimeout(r2, 100));
     ok(followups.length === 1, '限频生效：10 秒内第二条不推送（页面收到失败回执）');
     disposeAK();
+  }
+}
+
+// 13.80b v1.9.17 真机回归线：「问 DSH」报「没有活跃的 DSH 会话」而用户明明开着会话
+// 真机复现（2026-11-25，CDP 直投队列）：页面入队 → 宿主 ~2s 排空 → 回执「✗ 没有活跃的 DSH 会话」。
+// 根因：onReaderAsk 只从 agents.roots()（顶层 agent，owner===undefined）取会话；当前活跃会话不是
+// 顶层 root（由桌面端持有关系创建）→ roots 为空 → 判「无会话」。宿主自己的 session-controller
+// 走 agents.get(id)，不受影响。鉴别力：修复前 roots 为空即失败（红）；修复后回退 list()（绿）。
+{
+  const mkAskWorld = (tag, agentsSvc) => {
+    const reg = { web: [], tools: [] };
+    const followups = [];
+    const ctx = {
+      effect: (fn) => { fn(); return () => {}; }, inject: () => () => {},
+      get: (name) => (name === 'agents' ? agentsSvc(followups) : undefined),
+      webServer: { register: (x) => reg.web.push(x) }, tools: { register: (x) => reg.tools.push(x) },
+    };
+    const world = { alive: false, targets: [], url: `https://weread.qq.com/web/reader/${tag}`, drained: 0 };
+    const deps = {
+      fetchJson: async (p, pathname) => {
+        if (!world.alive) throw new Error('ECONNREFUSED');
+        if (pathname === '/json/version') return { Browser: 'Chrome/147.0.0.0', webSocketDebuggerUrl: `ws://127.0.0.1:${p}/devtools/browser/b` };
+        if (pathname === '/json/list') return world.targets;
+        throw new Error('unexpected ' + pathname);
+      },
+      wsCall: async (wsUrl, commands) => {
+        const cmd = commands[0];
+        if (cmd.method === 'Runtime.evaluate' && cmd.params?.expression?.includes('__wrAskDSH') && cmd.params?.expression?.includes('splice')) {
+          world.drained += 1;
+          const payload = world.drained === 1 ? JSON.stringify([{ seq: 11, q: '这句话什么意思？', sel: '', book: '问询书 - 某作者 - 微信读书', chapter: '第一章', url: world.url, at: 1 }]) : null;
+          return [{ id: 1, result: { result: { type: 'string', value: payload } } }];
+        }
+        return [{ id: 1, result: cmd.method === 'Network.getCookies' ? { cookies: [] } : cmd.method === 'Browser.getWindowForTarget' ? { windowId: 1, bounds: { left: 0, top: 0, width: 800, height: 600 } } : {} }];
+      },
+      launchProcess: async () => { world.alive = true; world.targets = [{ id: 'AW0', type: 'page', url: world.url, webSocketDebuggerUrl: `ws://127.0.0.1:47896/devtools/page/AW0` }]; return { pid: 9500 }; },
+      execOpen: async () => ({ ok: false, error: 'no-open' }), listPids: async () => [], killPid: () => {}, sleep: async () => {},
+      closeTarget: async () => { world.targets = []; }, chromeExecutable: () => '/fake/Chrome',
+      timeouts: { tier1: 20, tier2: 20, ready: 20, boundsWatch: 60_000, injectWatch: 25, jamWatch: 60_000, harvestWatch: 60_000 },
+    };
+    return { reg, ctx, followups, world, deps };
+  };
+  const live = (id, followups, extra = {}) => ({ id, session: id, status: 'idle', followup: (m) => followups.push(m), ...extra });
+
+  // A) 真机形态：roots() 为空，活跃会话只在 list() 里 → 修复前失败
+  {
+    const m = mkAskWorld('noRoot', (f) => ({ roots: () => [], list: () => [live('sess-child-1', f)] }));
+    const dispose = apply(m.ctx, { stateDir: path.join(tmp, 'state-ask-noroot'), outputPath: path.join(tmp, 'out-ask-noroot'), apiToken: SMOKE_TOKEN, readerDeps: m.deps, keychain: false });
+    try {
+      // 必须经 /api/open-reader 开窗：注入守护随开窗启动，才会排空「问 DSH」队列（首版漏了这步）
+      const route = m.reg.web.find((x) => x.path === '/weread');
+      await call('GET', '/weread/api/state', null, route, 'Bearer seed-ask');
+      const askAuth = 'Bearer ' + JSON.parse(fs.readFileSync(path.join(path.join(tmp, 'state-ask-noroot'), 'endpoint.json'), 'utf8')).token;
+      const opened = await call('POST', '/weread/api/open-reader', { url: m.world.url }, route, askAuth);
+      ok(opened.payload?.ok === true, '前置：阅读窗口已开（注入守护启动）');
+      await new Promise((r2) => setTimeout(r2, 400)); // 开书 + 注入守护排空队列
+      ok(m.world.drained >= 1, 'A 前置：宿主已排空「问 DSH」队列');
+      ok(m.followups.length === 1, `A：roots 为空但 list() 有活跃会话 → 仍推送到会话（followup ${m.followups.length} 次；修复前 0 次，报「没有活跃的 DSH 会话」）`);
+    } finally { dispose(); }
+  }
+
+  // B) 兜底顺序：roots 优先；roots 为空才回退 list()
+  {
+    const m = mkAskWorld('rootFirst', (f) => ({ roots: () => [live('sess-root', f)], list: () => [live('sess-child', f), live('sess-root', f)] }));
+    const dispose = apply(m.ctx, { stateDir: path.join(tmp, 'state-ask-rootfirst'), outputPath: path.join(tmp, 'out-ask-rootfirst'), apiToken: SMOKE_TOKEN, readerDeps: m.deps, keychain: false });
+    try {
+      // 必须经 /api/open-reader 开窗：注入守护随开窗启动，才会排空「问 DSH」队列（首版漏了这步）
+      const route = m.reg.web.find((x) => x.path === '/weread');
+      await call('GET', '/weread/api/state', null, route, 'Bearer seed-ask');
+      const askAuth = 'Bearer ' + JSON.parse(fs.readFileSync(path.join(path.join(tmp, 'state-ask-rootfirst'), 'endpoint.json'), 'utf8')).token;
+      const opened = await call('POST', '/weread/api/open-reader', { url: m.world.url }, route, askAuth);
+      ok(opened.payload?.ok === true, '前置：阅读窗口已开（注入守护启动）');
+      await new Promise((r2) => setTimeout(r2, 400));
+      ok(m.followups.length === 1, 'B：有顶层 root 时优先用 root（不改变既有选会话语义）');
+    } finally { dispose(); }
+  }
+
+  // C) 跳过已结束/无 followup 的会话，取最后一个真正可用的
+  {
+    const m = mkAskWorld('skipDead', (f) => ({ roots: () => [], list: () => [live('sess-dead', f, { status: 'disposed', followup: undefined }), live('sess-ok', f)] }));
+    const dispose = apply(m.ctx, { stateDir: path.join(tmp, 'state-ask-skipdead'), outputPath: path.join(tmp, 'out-ask-skipdead'), apiToken: SMOKE_TOKEN, readerDeps: m.deps, keychain: false });
+    try {
+      // 必须经 /api/open-reader 开窗：注入守护随开窗启动，才会排空「问 DSH」队列（首版漏了这步）
+      const route = m.reg.web.find((x) => x.path === '/weread');
+      await call('GET', '/weread/api/state', null, route, 'Bearer seed-ask');
+      const askAuth = 'Bearer ' + JSON.parse(fs.readFileSync(path.join(path.join(tmp, 'state-ask-skipdead'), 'endpoint.json'), 'utf8')).token;
+      const opened = await call('POST', '/weread/api/open-reader', { url: m.world.url }, route, askAuth);
+      ok(opened.payload?.ok === true, '前置：阅读窗口已开（注入守护启动）');
+      await new Promise((r2) => setTimeout(r2, 400));
+      ok(m.followups.length === 1, 'C：跳过不可用会话，投递到最后一个可用的');
+    } finally { dispose(); }
+  }
+
+  // D) 真的没有任何会话 → 仍是「没有活跃的 DSH 会话」（不误报成功）
+  {
+    const m = mkAskWorld('none', () => ({ roots: () => [], list: () => [] }));
+    const dispose = apply(m.ctx, { stateDir: path.join(tmp, 'state-ask-none'), outputPath: path.join(tmp, 'out-ask-none'), apiToken: SMOKE_TOKEN, readerDeps: m.deps, keychain: false });
+    try {
+      // 必须经 /api/open-reader 开窗：注入守护随开窗启动，才会排空「问 DSH」队列（首版漏了这步）
+      const route = m.reg.web.find((x) => x.path === '/weread');
+      await call('GET', '/weread/api/state', null, route, 'Bearer seed-ask');
+      const askAuth = 'Bearer ' + JSON.parse(fs.readFileSync(path.join(path.join(tmp, 'state-ask-none'), 'endpoint.json'), 'utf8')).token;
+      const opened = await call('POST', '/weread/api/open-reader', { url: m.world.url }, route, askAuth);
+      ok(opened.payload?.ok === true, '前置：阅读窗口已开（注入守护启动）');
+      await new Promise((r2) => setTimeout(r2, 400));
+      ok(m.world.drained >= 1 && m.followups.length === 0, 'D：确无会话 → 不投递（回执引导打开/唤醒会话）');
+    } finally { dispose(); }
+  }
+}
+
+// 13.80c v1.9.17 会话快照（apply 级）：「窗口没开也能恢复」——替代 v1.9.15 已回退的静默拉起
+// 设计：窗口在场时滚动记录「最近一次见到的有效会话」于 secrets.json（0600）；插件凭据失效且窗口
+// 不在场时用快照恢复，走同一个 adoptWindowSession（服务端裁决 + 账号保护）。
+// 不另起进程、不触碰用户窗口——避开 Chrome 同 profile 单实例的坑（v1.9.15 真机事故）。
+{
+  const mkSnap = (tag, { validSkeys, snapshot, fileCookie } = {}) => {
+    const reg = { web: [], tools: [] };
+    const ctx = { effect: (fn) => { fn(); return () => {}; }, inject: () => () => {}, webServer: { register: (x) => reg.web.push(x) }, tools: { register: (x) => reg.tools.push(x) } };
+    const dir = path.join(tmp, 'state-snap-' + tag);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'prefs.json'), JSON.stringify({ keychain: false })); // 隔离 Keychain 异步链
+    const secrets = { 'weread.vscode.U1.cookies': fileCookie ?? 'wr_vid=V1; wr_skey=S_DEAD' };
+    if (snapshot) secrets['weread.vscode.U1.sessionSnapshot'] = snapshot;
+    fs.writeFileSync(path.join(dir, 'secrets.json'), JSON.stringify(secrets));
+    fs.writeFileSync(path.join(dir, 'meta.json'), JSON.stringify({ version: 1, activeAccountId: 'U1', accounts: [{ accountId: 'U1', userId: 'U1', wrVid: 'V1', displayName: '快照账号', createdAt: 1, lastUsedAt: 1 }] }));
+    // 窗口**不在场**（无实例、state 无端口）——只有快照能救
+    const deps = {
+      fetchJson: async () => { throw new Error('ECONNREFUSED'); },
+      wsCall: async () => [{ id: 1, result: {} }], launchProcess: async () => ({ pid: 0 }), execOpen: async () => ({ ok: false }),
+      listPids: async () => [], killPid: () => {}, sleep: async () => {}, closeTarget: async () => {},
+      chromeExecutable: () => '/fake/Chrome', timeouts: { tier1: 10, tier2: 10, ready: 10 },
+    };
+    const seen = [];
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async (input, init = {}) => {
+      const u = String(input);
+      if (u.includes('/api/userInfo')) {
+        const h = init.headers ?? {};
+        const skey = String(typeof h.get === 'function' ? h.get('x-skey') : h['x-skey']);
+        seen.push(skey);
+        const ok = (validSkeys ?? []).includes(skey);
+        return { ok: true, text: async () => JSON.stringify(ok ? { user: { userId: 'U1', userVid: 'V1', name: '快照账号' } } : { errCode: -2012 }) };
+      }
+      if (u.includes('/api/user/notebook')) return { ok: true, status: 200, text: async () => JSON.stringify({ errCode: -2012 }) };
+      if (u === 'https://weread.qq.com/' && init.method === 'HEAD') return { ok: true, headers: { getSetCookie: () => [], get: () => null } };
+      return origFetch(input, init);
+    };
+    return { reg, ctx, dir, deps, seen, origFetch };
+  };
+  const skeyOf = (dir) => { const d = JSON.parse(fs.readFileSync(path.join(dir, 'secrets.json'), 'utf8')); return /wr_skey=([^;]*)/.exec(d['weread.vscode.U1.cookies'] ?? '')?.[1]; };
+
+  // A) 主功能：窗口没开 + 凭据已死 + 有新鲜快照 → 用快照恢复，不亮「已过期」
+  {
+    const m = mkSnap('a', { validSkeys: ['S_SNAP'], snapshot: { wrVid: 'V1', wrSkey: 'S_SNAP', savedAt: Date.now() - 5 * 60_000 } });
+    let dispose = null;
+    try {
+      dispose = apply(m.ctx, { stateDir: m.dir, outputPath: '', apiToken: SMOKE_TOKEN, readerDeps: m.deps, getAccountId: () => '' });
+      const route = m.reg.web.find((x) => x.path === '/weread');
+      await call('GET', '/weread/api/state', null, route, 'Bearer seed-snap');
+      const auth = 'Bearer ' + JSON.parse(fs.readFileSync(path.join(m.dir, 'endpoint.json'), 'utf8')).token;
+      let st = null;
+      for (let i = 0; i < 60; i++) { await new Promise((r2) => setTimeout(r2, 50)); st = (await call('GET', '/weread/api/state', undefined, route, auth)).payload; if (st.loggedIn === true) break; }
+      ok(m.seen.includes('S_SNAP'), `A：窗口没开 → 用快照会话做了服务端裁决（seen=${JSON.stringify(m.seen)}）`);
+      ok(st?.loggedIn === true && st?.loginExpired === false, 'A：凭据已死但靠快照恢复——不亮「登录已过期」，免重扫码');
+      ok(skeyOf(m.dir) === 'S_SNAP', `A：插件凭据已换为快照会话（实际 skey=${skeyOf(m.dir)}）`);
+      ok(st?.loginChannels?.cookie?.origin?.source === 'window', 'A：来源标记为 window（设置页可追溯）');
+    } finally { try { dispose?.(); } catch { /* ignore */ } globalThis.fetch = m.origFetch; }
+  }
+
+  // B) 安全：快照已在服务端过期 → 不采纳（绝不把死会话写进凭据）
+  {
+    const m = mkSnap('b', { validSkeys: [], snapshot: { wrVid: 'V1', wrSkey: 'S_STALE', savedAt: Date.now() - 40 * 86400_000 } });
+    let dispose = null;
+    try {
+      dispose = apply(m.ctx, { stateDir: m.dir, outputPath: '', apiToken: SMOKE_TOKEN, readerDeps: m.deps, getAccountId: () => '' });
+      const route = m.reg.web.find((x) => x.path === '/weread');
+      await call('GET', '/weread/api/state', null, route, 'Bearer seed-snap');
+      const auth = 'Bearer ' + JSON.parse(fs.readFileSync(path.join(m.dir, 'endpoint.json'), 'utf8')).token;
+      await new Promise((r2) => setTimeout(r2, 500));
+      const st = (await call('GET', '/weread/api/state', undefined, route, auth)).payload;
+      ok(m.seen.includes('S_STALE'), 'B 前置：快照确实被拿去做了服务端裁决');
+      ok(st?.loggedIn !== true, 'B：过期快照被判死 → 不恢复（仍引导重新登录）');
+      ok(skeyOf(m.dir) === 'S_DEAD', `B：凭据未被死快照覆盖（实际 skey=${skeyOf(m.dir)}）`);
+    } finally { try { dispose?.(); } catch { /* ignore */ } globalThis.fetch = m.origFetch; }
+  }
+
+  // C) 安全：快照属于别的账号 → 账号保护拒绝（防串号）
+  {
+    const m = mkSnap('c', { validSkeys: ['S_OTHER'], snapshot: { wrVid: 'V_OTHER', wrSkey: 'S_OTHER', savedAt: Date.now() - 60_000 } });
+    let dispose = null;
+    try {
+      dispose = apply(m.ctx, { stateDir: m.dir, outputPath: '', apiToken: SMOKE_TOKEN, readerDeps: m.deps, getAccountId: () => '' });
+      const route = m.reg.web.find((x) => x.path === '/weread');
+      await call('GET', '/weread/api/state', null, route, 'Bearer seed-snap');
+      const auth = 'Bearer ' + JSON.parse(fs.readFileSync(path.join(m.dir, 'endpoint.json'), 'utf8')).token;
+      await new Promise((r2) => setTimeout(r2, 500));
+      const st = (await call('GET', '/weread/api/state', undefined, route, auth)).payload;
+      ok(!m.seen.includes('S_OTHER'), 'C：快照 vid 与当前账号不符 → 账号保护在服务端裁决**之前**即拒绝（不发请求）');
+      ok(st?.loggedIn !== true && skeyOf(m.dir) === 'S_DEAD', 'C：不恢复、凭据不变（防把别的账号会话挂到当前账号下）');
+    } finally { try { dispose?.(); } catch { /* ignore */ } globalThis.fetch = m.origFetch; }
+  }
+
+  // D) 无快照：维持回退后的行为（不恢复），不报错
+  {
+    const m = mkSnap('d', { validSkeys: ['S_X'] });
+    let dispose = null;
+    try {
+      dispose = apply(m.ctx, { stateDir: m.dir, outputPath: '', apiToken: SMOKE_TOKEN, readerDeps: m.deps, getAccountId: () => '' });
+      const route = m.reg.web.find((x) => x.path === '/weread');
+      await call('GET', '/weread/api/state', null, route, 'Bearer seed-snap');
+      const auth = 'Bearer ' + JSON.parse(fs.readFileSync(path.join(m.dir, 'endpoint.json'), 'utf8')).token;
+      await new Promise((r2) => setTimeout(r2, 400));
+      const st = (await call('GET', '/weread/api/state', undefined, route, auth)).payload;
+      ok(st?.loggedIn !== true, 'D：无快照 → 不恢复（与回退后行为一致）');
+    } finally { try { dispose?.(); } catch { /* ignore */ } globalThis.fetch = m.origFetch; }
+  }
+
+  // E) 残缺快照（只有 vid，无 skey）→ 视为无快照
+  {
+    const m = mkSnap('e', { validSkeys: ['S_HALF'], snapshot: { wrVid: 'V1' } });
+    let dispose = null;
+    try {
+      dispose = apply(m.ctx, { stateDir: m.dir, outputPath: '', apiToken: SMOKE_TOKEN, readerDeps: m.deps, getAccountId: () => '' });
+      await new Promise((r2) => setTimeout(r2, 400));
+      ok(!m.seen.includes('S_HALF'), 'E：残缺快照不当会话用（不发裁决请求）');
+    } finally { try { dispose?.(); } catch { /* ignore */ } globalThis.fetch = m.origFetch; }
+  }
+}
+
+// 13.80c v1.9.19「问 DSH」按书 ID 精确找书 + 本地没有则即时导入（apply 级，真实索引 + 真实 Markdown 落盘）
+// 真机（2026-11-25）：在一本未同步过的书里选中即问，消息里没有任何本地笔记上下文——原逻辑只按书名
+// 在本地库匹配，而这本书从未同步过。用户确认方案 A：本地没有时自动把当前在读的这本书同步进库。
+// 世界：假 CDP（阅读窗口）+ fetch 桩（微信读书接口）+ 真实索引/导出/同步服务。
+{
+  const { createReaderWindow: _unused } = { createReaderWindow: null }; void _unused;
+  const ASK = { seq: 21, at: 1, q: '这句话什么意思？', sel: '', book: '即时导入的书 - 乙 - 微信读书', chapter: '第一章', url: 'https://weread.qq.com/web/reader/NEWBK01' };
+  const mkWorld = (tag, { cookie = 'wr_vid=V1; wr_skey=S_OK', remoteNotes } = {}) => {
+    const reg = { web: [], tools: [] };
+    const followups = [];
+    const ctx = { effect: (fn) => { fn(); return () => {}; }, inject: () => () => {},
+      get: (name) => (name === 'agents' ? { roots: () => [{ id: 'sess-' + tag, session: 'sess-' + tag, status: 'idle', followup: (m) => followups.push(m) }] } : undefined),
+      webServer: { register: (x) => reg.web.push(x) }, tools: { register: (x) => reg.tools.push(x) } };
+    const dir = path.join(tmp, 'state-askimp-' + tag);
+    const outDir = path.join(tmp, 'out-askimp-' + tag);
+    fs.rmSync(dir, { recursive: true, force: true }); fs.rmSync(outDir, { recursive: true, force: true });
+    fs.mkdirSync(dir, { recursive: true });
+    const secrets = {}; if (cookie) secrets['weread.vscode.U1.cookies'] = cookie;
+    fs.writeFileSync(path.join(dir, 'secrets.json'), JSON.stringify(secrets));
+    // autoSync:false——否则登录态下启动即触发后台全量同步，占住互斥让「即时导入」返回 busy（与本用例无关的干扰）
+    fs.writeFileSync(path.join(dir, 'prefs.json'), JSON.stringify({ autoSync: false, keychain: false }));
+    fs.writeFileSync(path.join(dir, 'meta.json'), JSON.stringify({ version: 1, activeAccountId: 'U1', accounts: [{ accountId: 'U1', userId: 'U1', wrVid: 'V1', displayName: '导入账号', createdAt: 1, lastUsedAt: 1 }] }));
+    const net = { bookmarklist: 0, bookInfo: 0, review: 0 };
+    const world = { alive: false, targets: [], url: ASK.url, drained: 0 };
+    const deps = {
+      fetchJson: async (p, pathname) => {
+        if (!world.alive) throw new Error('ECONNREFUSED');
+        if (pathname === '/json/version') return { Browser: 'Chrome/147.0.0.0', webSocketDebuggerUrl: `ws://127.0.0.1:${p}/devtools/browser/b` };
+        if (pathname === '/json/list') return world.targets;
+        throw new Error('unexpected ' + pathname);
+      },
+      wsCall: async (wsUrl, commands) => {
+        const cmd = commands[0];
+        if (cmd.method === 'Runtime.evaluate' && cmd.params?.expression?.includes('__wrAskDSH') && cmd.params?.expression?.includes('splice')) {
+          world.drained += 1;
+          return [{ id: 1, result: { result: { type: 'string', value: world.drained === 1 ? JSON.stringify([ASK]) : null } } }];
+        }
+        return [{ id: 1, result: cmd.method === 'Network.getCookies' ? { cookies: [] } : cmd.method === 'Browser.getWindowForTarget' ? { windowId: 1, bounds: { left: 0, top: 0, width: 800, height: 600 } } : {} }];
+      },
+      launchProcess: async () => { world.alive = true; world.targets = [{ id: 'AI0', type: 'page', url: world.url, webSocketDebuggerUrl: `ws://127.0.0.1:47962/devtools/page/AI0` }]; return { pid: 9950 }; },
+      execOpen: async () => ({ ok: false, error: 'no-open' }), listPids: async () => [], killPid: () => {}, sleep: async () => {},
+      closeTarget: async () => { world.targets = []; }, chromeExecutable: () => '/fake/Chrome',
+      timeouts: { tier1: 20, tier2: 20, ready: 20, silentReady: 20, boundsWatch: 60_000, injectWatch: 20, jamWatch: 60_000, harvestWatch: 60_000 },
+      checkSession: async () => undefined,
+    };
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async (input, init = {}) => {
+      const u = String(input);
+      if (u.includes('/api/user/info') || u.includes('/api/userInfo')) return { ok: true, text: async () => JSON.stringify({ user: { userId: 'U1', userVid: 'V1', name: '导入账号' } }) };
+      if (u.includes('/api/user/notebook')) return { ok: true, text: async () => JSON.stringify({ books: [] }) };
+      if (u.includes('bookmarklist')) { net.bookmarklist += 1; return { ok: true, text: async () => JSON.stringify({ books: remoteNotes ?? [] }) }; }
+      if (u.includes('/book/info')) { net.bookInfo += 1; return { ok: true, text: async () => JSON.stringify({ bookId: 'NEWBK01', title: '即时导入的书', author: '乙', cover: '', category: '文学', intro: '简介', progress: 0.25, readingStatus: 0 }) }; }
+      if (u.includes('/review/list')) { net.review += 1; return { ok: true, text: async () => JSON.stringify({ reviews: [] }) }; }
+      if (u === 'https://weread.qq.com/' && init.method === 'HEAD') return { ok: true, headers: { getSetCookie: () => [], get: () => null } };
+      return { ok: true, status: 200, text: async () => '' };
+    };
+    return { reg, ctx, followups, dir, outDir, net, world, deps, origFetch };
+  };
+  const walk = (d) => { let o = []; try { for (const f of fs.readdirSync(d)) { const p = path.join(d, f); if (fs.statSync(p).isDirectory()) o.push(...walk(p)); else if (f.endsWith('.md')) o.push(p); } } catch { /* 无目录 */ } return o; };
+  const askText = (f) => f?.content?.[0]?.text ?? '';
+  const waitFollowup = async (m, ms = 6000) => { for (let i = 0; i < ms / 50; i++) { if (m.followups.length) break; await new Promise((r2) => setTimeout(r2, 50)); } return m.followups[0]; };
+  const NOTE = { bookmarkId: 'nb-bm1', bookId: 'NEWBK01', chapterUid: 1, chapterTitle: '第一章', type: 0, markText: '这是被划下的一句原文', createTime: 1700000000, range: '1-10' };
+
+  // A) 主路径：本地库没有这本书 → 按页面 URL 的书 ID 即时导入 → 消息带上它的笔记；笔记文件真的落盘
+  {
+    const m = mkWorld('a', { remoteNotes: [NOTE] });
+    let dispose = null;
+    try {
+      dispose = apply(m.ctx, { stateDir: m.dir, outputPath: m.outDir, apiToken: SMOKE_TOKEN, readerDeps: m.deps, getAccountId: () => '' });
+      const route = m.reg.web.find((x) => x.path === '/weread');
+      await call('GET', '/weread/api/state', null, route, 'Bearer seed-imp');
+      const auth = 'Bearer ' + JSON.parse(fs.readFileSync(path.join(m.dir, 'endpoint.json'), 'utf8')).token;
+      const opened = await call('POST', '/weread/api/open-reader', { url: m.world.url }, route, auth);
+      ok(opened.payload?.ok === true, 'A 前置：阅读窗口已开（书页 URL 带书 ID）');
+      const msg = await waitFollowup(m);
+      ok(!!msg, 'A：提问已送达 DSH 会话（导入链路没有卡住提问）');
+      const text = askText(msg);
+      ok(/已即时同步 1 条笔记/.test(text), 'A：本地库没有这本书 → 已即时同步进库，并在消息里注明');
+      ok(/本地笔记：bookId=NEWBK01/.test(text), 'A：按页面 URL 的书 ID 精确命中本地笔记');
+      ok(/用户在本书的近期划线：「这是被划下的一句原文」（第一章）/.test(text), 'A：消息带上这本书的近期划线（AI 可据此作答）');
+      ok(/《即时导入的书》/.test(text), 'A：书名取自书详情接口（页面书名只作兜底）');
+      // 只数笔记库（accounts/）下的文件：插件启动时既有的「阅读周报」功能会在 阅读洞察报告/ 下生成周报，与本用例无关
+      const files = walk(path.join(m.outDir, 'accounts'));
+      ok(files.length === 1 && /NEWBK01/.test(fs.readFileSync(files[0], 'utf8')), `A：笔记文件真的写进了笔记目录（${files.length} 个 .md）`);
+      ok(m.net.bookmarklist === 1 && m.net.bookInfo === 1, `A：只拉了这一本书（划线 × ${m.net.bookmarklist}、书详情 × ${m.net.bookInfo}）——不是整架重同步`);
+    } finally { try { dispose?.(); } catch { /* ignore */ } globalThis.fetch = m.origFetch; }
+  }
+
+  // B) 这本书在微信读书里没有任何划线/想法 → 不导出（不制造空文件），并向 AI 说明原因
+  {
+    const m = mkWorld('b', { remoteNotes: [] });
+    let dispose = null;
+    try {
+      dispose = apply(m.ctx, { stateDir: m.dir, outputPath: m.outDir, apiToken: SMOKE_TOKEN, readerDeps: m.deps, getAccountId: () => '' });
+      const route = m.reg.web.find((x) => x.path === '/weread');
+      await call('GET', '/weread/api/state', null, route, 'Bearer seed-imp');
+      const auth = 'Bearer ' + JSON.parse(fs.readFileSync(path.join(m.dir, 'endpoint.json'), 'utf8')).token;
+      await call('POST', '/weread/api/open-reader', { url: m.world.url }, route, auth);
+      const msg = await waitFollowup(m);
+      const text = askText(msg);
+      ok(!!msg && /本书不在本地笔记库（这本书在微信读书里还没有划线或想法）/.test(text), 'B：没有笔记 → 不导入，消息里向 AI 说明原因');
+      ok(/请基于通用知识回答，并明确注明并非出自本地笔记/.test(text), 'B：明确要求 AI 基于通用知识回答并注明出处（原先 AI 只能干答「本地库里没有」）');
+      ok(walk(path.join(m.outDir, 'accounts')).length === 0 && m.net.bookInfo === 0, 'B：没有生成文件，也没白取书详情');
+    } finally { try { dispose?.(); } catch { /* ignore */ } globalThis.fetch = m.origFetch; }
+  }
+
+  // C) 未登录 → 不尝试导入、零网络请求；提问照常送达并说明情况
+  {
+    const m = mkWorld('c', { cookie: null, remoteNotes: [NOTE] });
+    let dispose = null;
+    try {
+      dispose = apply(m.ctx, { stateDir: m.dir, outputPath: m.outDir, apiToken: SMOKE_TOKEN, readerDeps: m.deps, getAccountId: () => '' });
+      const route = m.reg.web.find((x) => x.path === '/weread');
+      await call('GET', '/weread/api/state', null, route, 'Bearer seed-imp');
+      const auth = 'Bearer ' + JSON.parse(fs.readFileSync(path.join(m.dir, 'endpoint.json'), 'utf8')).token;
+      await call('POST', '/weread/api/open-reader', { url: m.world.url }, route, auth);
+      const msg = await waitFollowup(m);
+      ok(!!msg && /本书不在本地笔记库（插件未登录）/.test(askText(msg)), 'C：未登录 → 提问照常送达，消息说明「插件未登录」');
+      ok(m.net.bookmarklist === 0 && m.net.bookInfo === 0, 'C：未登录不发任何取书请求');
+    } finally { try { dispose?.(); } catch { /* ignore */ } globalThis.fetch = m.origFetch; }
+  }
+
+  // D) 书已在本地库（按书 ID 命中）→ 不重复导入、不触网
+  {
+    const m = mkWorld('d', { remoteNotes: [NOTE] });
+    fs.mkdirSync(path.join(m.outDir, 'accounts', 'U1', '文学'), { recursive: true });
+    fs.writeFileSync(path.join(m.outDir, 'accounts', 'U1', '文学', 'already.md'), `---\ntitle: 已在库的书\nbookid: NEWBK01\nauthor: 乙\nprogress: 10%\nnoteCount: 1\nlastReadTime: 1700000000\n---\n\n# 已在库的书\n\n## 第一章\n\n- 已有的划线\n`);
+    let dispose = null;
+    try {
+      dispose = apply(m.ctx, { stateDir: m.dir, outputPath: m.outDir, apiToken: SMOKE_TOKEN, readerDeps: m.deps, getAccountId: () => '' });
+      const route = m.reg.web.find((x) => x.path === '/weread');
+      await call('GET', '/weread/api/state', null, route, 'Bearer seed-imp');
+      const auth = 'Bearer ' + JSON.parse(fs.readFileSync(path.join(m.dir, 'endpoint.json'), 'utf8')).token;
+      await call('POST', '/weread/api/open-reader', { url: m.world.url }, route, auth);
+      const msg = await waitFollowup(m);
+      const text = askText(msg);
+      ok(!!msg && /本地笔记：bookId=NEWBK01/.test(text) && !/已即时同步/.test(text), 'D：书已在库 → 按书 ID 直接命中，不重复导入');
+      ok(m.net.bookmarklist === 0 && m.net.bookInfo === 0, 'D：已在库时不发任何取书请求');
+    } finally { try { dispose?.(); } catch { /* ignore */ } globalThis.fetch = m.origFetch; }
+  }
+}
+
+// 13.80d v1.9.19 官方 Skill 一键升级（apply 级：真实网关客户端 + 真实 prefs 落盘 + fetch 桩）
+// 「Skill」= 官方给 AI 看的接口说明文档（zip 里的 Markdown），插件不运行它，只用其版本号随每次网关请求上报。
+// 升级 = 下载官方包 → 只读出 SKILL.md 的版本号 → 切换 → 用新版本打一次最小请求验证 → 失败回滚。
+{
+  const { SKILL_VERSION, DEFAULT_SKILL_ZIP_URL } = await import('./lib/gateway.js').then(() => import('./lib/skillUpgrade.js')).then(async (m) => ({ ...(await import('./lib/gateway.js')), ...m }));
+  // 手工拼 STORE 方式的 zip（DEFLATE 与各类拒绝路径由 test/skillupgrade.test.js 覆盖）
+  const C = Array.from({ length: 256 }, (_, n) => { let c = n; for (let k = 0; k < 8; k += 1) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; return c >>> 0; });
+  const crc32 = (b) => { let c = 0xffffffff; for (const x of b) c = C[(c ^ x) & 0xff] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; };
+  const u16 = (v) => [v & 255, (v >>> 8) & 255]; const u32 = (v) => [v & 255, (v >>> 8) & 255, (v >>> 16) & 255, (v >>> 24) & 255];
+  const mkZip = (entries) => { const local = []; const central = []; let offset = 0;
+    for (const e of entries) { const raw = Buffer.from(e.content, 'utf8'); const name = Buffer.from(e.name, 'utf8'); const crc = crc32(raw);
+      const lh = Buffer.from([0x50, 0x4b, 0x03, 0x04, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, ...u32(crc), ...u32(raw.length), ...u32(raw.length), ...u16(name.length), ...u16(0)]);
+      local.push(lh, name, raw);
+      central.push(Buffer.from([0x50, 0x4b, 0x01, 0x02, 20, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, ...u32(crc), ...u32(raw.length), ...u32(raw.length), ...u16(name.length), ...u16(0), ...u16(0), ...u16(0), ...u16(0), ...u32(0), ...u32(offset)]), name);
+      offset += lh.length + name.length + raw.length; }
+    const cd = Buffer.concat(central); const ld = Buffer.concat(local);
+    return Buffer.concat([ld, cd, Buffer.from([0x50, 0x4b, 0x05, 0x06, 0, 0, 0, 0, ...u16(entries.length), ...u16(entries.length), ...u32(cd.length), ...u32(ld.length), ...u16(0)])]); };
+  const skillZip = (v) => mkZip([{ name: 'weread-skills/notes.md', content: '# notes' }, { name: 'weread-skills/SKILL.md', content: `---\nname: weread-skills\ndescription: 微信读书助手\nversion: ${v}\n---\n\n# WeRead\n` }]);
+  const OFFICIAL_URL = 'https://cdn.weread.qq.com/skills/weread-skills.zip';
+  const mkWorld = (tag, { withKey = true, prefs = {} } = {}) => {
+    const reg = { web: [], tools: [] };
+    const ctx = { effect: (fn) => { fn(); return () => {}; }, inject: () => () => {}, webServer: { register: (x) => reg.web.push(x) }, tools: { register: (x) => reg.tools.push(x) } };
+    const dir = path.join(tmp, 'state-skillup-' + tag);
+    fs.rmSync(dir, { recursive: true, force: true }); fs.mkdirSync(dir, { recursive: true });
+    const secrets = {}; if (withKey) secrets['weread.vscode.U1.apiKey'] = 'wrk-test';
+    fs.writeFileSync(path.join(dir, 'secrets.json'), JSON.stringify(secrets));
+    fs.writeFileSync(path.join(dir, 'prefs.json'), JSON.stringify({ keychain: false, autoSync: false, ...prefs }));
+    fs.writeFileSync(path.join(dir, 'meta.json'), JSON.stringify({ version: 1, activeAccountId: 'U1', accounts: [{ accountId: 'U1', userId: 'U1', displayName: '升级账号', createdAt: 1, lastUsedAt: 1 }] }));
+    const net = { gw: [], downloads: [] };
+    const cfg = { zip: skillZip('1.0.7'), upgradeInfo: null, rejectVersions: new Set(), contentLength: null, gate: null };
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async (input, init = {}) => {
+      const u = String(input);
+      if (u.startsWith('https://i.weread.qq.com/')) {
+        const body = JSON.parse(init.body || '{}'); net.gw.push(body);
+        if (cfg.rejectVersions.has(body.skill_version)) return { ok: false, status: 400, text: async () => JSON.stringify({ errcode: 400, errMsg: `skill_version ${body.skill_version} not accepted` }) };
+        return { ok: true, status: 200, text: async () => JSON.stringify({ errcode: 0, data: [], ...(cfg.upgradeInfo ? { upgrade_info: cfg.upgradeInfo } : {}) }) };
+      }
+      if (u.startsWith('https://cdn.weread.qq.com/')) {
+        net.downloads.push(u);
+        const len = cfg.contentLength ?? cfg.zip.length;
+        return { ok: true, status: 200, url: u, headers: { get: (k) => (k === 'content-length' ? String(len) : null) },
+          arrayBuffer: async () => { if (cfg.gate) await cfg.gate; return cfg.zip.buffer.slice(cfg.zip.byteOffset, cfg.zip.byteOffset + cfg.zip.byteLength); } };
+      }
+      if (u === 'https://weread.qq.com/' && init.method === 'HEAD') return { ok: true, headers: { getSetCookie: () => [], get: () => null } };
+      return { ok: true, status: 200, text: async () => '' };
+    };
+    const prefsNow = () => JSON.parse(fs.readFileSync(path.join(dir, 'prefs.json'), 'utf8'));
+    return { reg, ctx, dir, net, cfg, prefsNow, origFetch };
+  };
+  const AUTH = 'Bearer ' + SMOKE_TOKEN;
+  const boot = async (m) => {
+    const dispose = apply(m.ctx, { stateDir: m.dir, outputPath: '', apiToken: SMOKE_TOKEN });
+    const route = m.reg.web.find((x) => x.path === '/weread');
+    const state = async () => (await call('GET', '/weread/api/state', undefined, route, AUTH)).payload;
+    return { dispose, route, state };
+  };
+  const NOTICE = { latest_version: '1.0.7', current_version: SKILL_VERSION, message: '微信读书 Skill 有新版本。', upgrade_url: OFFICIAL_URL };
+
+  // A) 完整流程：出现升级提示 → 一键升级 → 版本切换落盘、提示消失、后续请求带新版本；再点一次 = 已是最新
+  {
+    const m = mkWorld('a'); const { dispose, route, state } = await boot(m);
+    try {
+      let st = await state();
+      ok(st.gateway.enabled && st.gateway.skillVersion === SKILL_VERSION && st.gateway.skillVersionOverridden === false && st.gateway.upgrade === null, `A 前置：已绑定 Key，生效版本 = 内置 v${SKILL_VERSION}，无升级提示`);
+      m.cfg.upgradeInfo = NOTICE;
+      await call('POST', '/weread/api/gateway/test', {}, route, AUTH); // 一次网关请求带回 upgrade_info
+      st = await state();
+      ok(st.gateway.upgrade?.info?.latest_version === '1.0.7', 'A：服务端提示新版本 → 设置页拿到升级提示（最新版 > 当前才算）');
+      const r = await call('POST', '/weread/api/gateway/skill-upgrade', {}, route, AUTH);
+      ok(r.status === 200 && r.payload.ok && r.payload.changed && r.payload.from === SKILL_VERSION && r.payload.to === '1.0.7', `A：一键升级 v${SKILL_VERSION} → v1.0.7（${JSON.stringify(r.payload).slice(0, 90)}）`);
+      ok(m.net.downloads.at(-1) === NOTICE.upgrade_url, 'A：从服务端给的官方地址下载');
+      ok(m.prefsNow().skillVersion === '1.0.7', 'A：新版本落盘 prefs（重启后仍生效）');
+      ok(m.net.gw.at(-1).skill_version === '1.0.7', 'A：切换后立刻用**新版本号**打了一次最小请求做连通性验证');
+      st = await state();
+      ok(st.gateway.skillVersion === '1.0.7' && st.gateway.skillVersionOverridden === true && st.gateway.bundledSkillVersion === SKILL_VERSION, 'A：state 报告生效版本 v1.0.7（内置仍为旧值，可追溯）');
+      ok(st.gateway.upgrade === null, 'A：升级提示消失——服务端仍回旧提示也不算数（最新版 ≤ 当前）');
+      const t = await call('POST', '/weread/api/gateway/test', {}, route, AUTH);
+      ok(t.payload.skillVersion === '1.0.7' && m.net.gw.at(-1).skill_version === '1.0.7', 'A：之后的每次网关请求都带 v1.0.7（无需重启）');
+      const again = await call('POST', '/weread/api/gateway/skill-upgrade', {}, route, AUTH);
+      ok(again.status === 200 && again.payload.ok && again.payload.changed === false && again.payload.version === '1.0.7', 'A：再点一次 → 「已是最新」，不做改动');
+    } finally { try { dispose(); } catch { /* ignore */ } globalThis.fetch = m.origFetch; }
+  }
+
+  // B) 切换后服务端不接受新版本 → 回滚到之前的版本，插件不停在坏版本上
+  for (const [label, pre, expectRestored] of [['从内置版本升级', undefined, undefined], ['从插件内已升级的 v1.0.4 再升', '1.0.4', '1.0.4']]) {
+    const m = mkWorld('b-' + (pre ?? 'bundled'), { prefs: pre ? { skillVersion: pre } : {} });
+    m.cfg.rejectVersions = new Set(['1.0.7']); const { dispose, route, state } = await boot(m);
+    try {
+      const r = await call('POST', '/weread/api/gateway/skill-upgrade', {}, route, AUTH);
+      ok(r.status === 502 && r.payload.ok === false && r.payload.rolledBack === true && /已回退/.test(r.payload.error), `B（${label}）：新版本验证失败 → 502 + 已回退（${String(r.payload.error).slice(0, 60)}）`);
+      const p = m.prefsNow();
+      ok((pre ? p.skillVersion === expectRestored : p.skillVersion === undefined), `B（${label}）：偏好恢复为升级前的版本（${pre ?? '未设置 → 用内置'}）`);
+      const st = await state();
+      ok(st.gateway.skillVersion === (pre ?? SKILL_VERSION) && st.gateway.skillVersionOverridden === !!pre, `B（${label}）：生效版本回到 v${pre ?? SKILL_VERSION}`);
+      await call('POST', '/weread/api/gateway/test', {}, route, AUTH);
+      ok(m.net.gw.at(-1).skill_version === (pre ?? SKILL_VERSION), `B（${label}）：之后的请求恢复带 v${pre ?? SKILL_VERSION}`);
+    } finally { try { dispose(); } catch { /* ignore */ } globalThis.fetch = m.origFetch; }
+  }
+
+  // C) 包里版本不高于当前 → 不做改动（相同=已是最新；更低=拒绝）
+  {
+    const m = mkWorld('c'); const { dispose, route } = await boot(m);
+    try {
+      m.cfg.zip = skillZip(SKILL_VERSION);
+      let r = await call('POST', '/weread/api/gateway/skill-upgrade', {}, route, AUTH);
+      ok(r.status === 200 && r.payload.changed === false && r.payload.version === SKILL_VERSION, 'C：包里版本 = 当前 → 已是最新，不改');
+      m.cfg.zip = skillZip('1.0.0');
+      r = await call('POST', '/weread/api/gateway/skill-upgrade', {}, route, AUTH);
+      ok(r.status === 400 && r.payload.changed !== true && /不高于当前/.test(r.payload.error), 'C：包里版本更低 → 拒绝（不降级）');
+      ok(m.prefsNow().skillVersion === undefined, 'C：偏好未被改动');
+    } finally { try { dispose(); } catch { /* ignore */ } globalThis.fetch = m.origFetch; }
+  }
+
+  // D) 服务端给的升级地址不可信（非官方 CDN）→ 不去下载它，回落到内置官方地址
+  {
+    const m = mkWorld('d'); const { dispose, route } = await boot(m);
+    try {
+      m.cfg.upgradeInfo = { ...NOTICE, upgrade_url: 'https://evil.example/skills/weread-skills.zip' };
+      await call('POST', '/weread/api/gateway/test', {}, route, AUTH); // 让提示落库
+      const r = await call('POST', '/weread/api/gateway/skill-upgrade', {}, route, AUTH);
+      ok(r.payload?.ok === true && r.payload.to === '1.0.7', 'D：仍能升级');
+      ok(m.net.downloads.length >= 1 && m.net.downloads.every((u) => u.startsWith('https://cdn.weread.qq.com/')), `D：只访问官方 CDN（实际：${m.net.downloads.join(', ')}）`);
+      ok(m.net.downloads.at(-1) === DEFAULT_SKILL_ZIP_URL, 'D：不可信地址被丢弃，改用内置官方地址');
+    } finally { try { dispose(); } catch { /* ignore */ } globalThis.fetch = m.origFetch; }
+  }
+
+  // E) 包损坏 / 体积超限 → 明确失败，偏好不动
+  {
+    const m = mkWorld('e'); const { dispose, route } = await boot(m);
+    try {
+      m.cfg.zip = Buffer.from('this is not a zip at all');
+      let r = await call('POST', '/weread/api/gateway/skill-upgrade', {}, route, AUTH);
+      ok(r.status === 502 && r.payload.ok === false && /升级失败/.test(r.payload.error), 'E：损坏的升级包 → 502，带中文原因');
+      m.cfg.zip = skillZip('9.9.9'); m.cfg.contentLength = 50 * 1024 * 1024;
+      r = await call('POST', '/weread/api/gateway/skill-upgrade', {}, route, AUTH);
+      ok(r.status === 502 && /超出大小上限/.test(r.payload.error), 'E：体积超限 → 拒绝');
+      ok(m.prefsNow().skillVersion === undefined, 'E：两次失败都没有改动偏好');
+    } finally { try { dispose(); } catch { /* ignore */ } globalThis.fetch = m.origFetch; }
+  }
+
+  // F) 未绑定 API Key → 400，不下载
+  {
+    const m = mkWorld('f', { withKey: false }); const { dispose, route } = await boot(m);
+    try {
+      const r = await call('POST', '/weread/api/gateway/skill-upgrade', {}, route, AUTH);
+      ok(r.status === 400 && /未绑定 API Key/.test(r.payload.error) && m.net.downloads.length === 0, 'F：未绑定 Key → 400，且不下载');
+    } finally { try { dispose(); } catch { /* ignore */ } globalThis.fetch = m.origFetch; }
+  }
+
+  // G) 连点两次：第二次 409，不重复下载
+  {
+    const m = mkWorld('g'); const { dispose, route } = await boot(m);
+    let release; const gate = new Promise((res) => { release = res; }); m.cfg.gate = gate;
+    try {
+      const first = call('POST', '/weread/api/gateway/skill-upgrade', {}, route, AUTH);
+      for (let i = 0; i < 100 && m.net.downloads.length === 0; i++) await new Promise((r2) => setTimeout(r2, 10));
+      const second = await call('POST', '/weread/api/gateway/skill-upgrade', {}, route, AUTH);
+      ok(second.status === 409, 'G：升级进行中再点 → 409');
+      release(); m.cfg.gate = null;
+      const r = await first;
+      ok(r.payload?.ok === true && m.net.downloads.length === 1, `G：首次升级正常完成，只下载了一次（${m.net.downloads.length}）`);
+    } finally { release?.(); try { dispose(); } catch { /* ignore */ } globalThis.fetch = m.origFetch; }
   }
 }
 

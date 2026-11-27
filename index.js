@@ -19,6 +19,7 @@ import { createRoamingService } from './lib/roaming.js';
 import { createCleanupService } from './lib/cleanup.js';
 import * as markdown from './lib/markdown.js';
 import { createGatewayClient, apiKeyTail, SKILL_VERSION } from './lib/gateway.js';
+import { isAllowedSkillUpgradeUrl, extractSkillVersionFromZip, compareSemver, parseSemver, DEFAULT_SKILL_ZIP_URL, SKILL_ZIP_MAX_BYTES } from './lib/skillUpgrade.js';
 import { createReaderWindow } from './lib/readerWindow.js';
 import { createWsBus } from './lib/wsbus.mjs';
 import { createSvg as createQrSvg } from './lib/vendor/qrcode/index.cjs'; // v1.8.8：本地二维码（去 qrserver.com 外网依赖）
@@ -90,6 +91,12 @@ export function apply(ctx, rawConfig = {}) {
   const readPrefs = () => { try { return JSON.parse(fs.readFileSync(prefsFile, 'utf8')); } catch { return {}; } };
   const writePrefs = (next) => fs.writeFileSync(prefsFile, JSON.stringify(next, null, 2));
   let prefs = readPrefs();
+  // v1.9.19：生效的官方 Skill 版本——设置页一键升级后存 prefs.skillVersion（下次请求即用，无需重启）；
+  // 缺省或非法值回落到内置常量 SKILL_VERSION（随插件发版更新的兜底）。
+  const effectiveSkillVersion = () => {
+    const v = String(prefs.skillVersion ?? '').trim().replace(/^v/, '');
+    return parseSemver(v) ? v : SKILL_VERSION;
+  };
 
   const config = () => ({
     outputPath: prefs.outputPath ?? rawConfig.outputPath ?? '',
@@ -140,6 +147,7 @@ export function apply(ctx, rawConfig = {}) {
     log: logOp,
     getState: (key) => store.getState(store.getActiveAccountId(), key, null),
     setState: (key, value) => store.setState(store.getActiveAccountId(), key, value),
+    getSkillVersion: effectiveSkillVersion, // v1.9.19
   });
   /** 活跃账号的 Key 注入网关；返回是否在场 */
   const syncGatewayKey = () => {
@@ -191,6 +199,8 @@ export function apply(ctx, rawConfig = {}) {
   // （winOk=undefined）不冷却——不惩罚瞬时故障。插件凭据换血/窗内换新会话 → 指纹变 → 不受影响。
   const adoptRejectCooldown = new Map(); // `vid|skey` -> 拒绝时间
   const ADOPT_REJECT_COOLDOWN_MS = 60 * 60 * 1000;
+  // v1.9.14：/api/login/verify 路径的窗内会话探测节流（同指纹 10s）——弹层未登录时 3s 重核的配套护栏
+  const verifyAdoptProbeAt = new Map(); // `vid|skey` -> 最近探测时间
   const markAdoptRejected = (key) => {
     if (adoptRejectCooldown.size >= 32) adoptRejectCooldown.delete(adoptRejectCooldown.keys().next().value);
     adoptRejectCooldown.set(key, Date.now());
@@ -236,6 +246,33 @@ export function apply(ctx, rawConfig = {}) {
       return !!res;
     } catch { return false; /* best effort */ }
   };
+  // v1.9.19「问 DSH」即时导入：本地库没有当前在读的这本书时，现取它的笔记导出进库（用户确认的方案 A），
+  // 让提问默认带上这本书的笔记。护栏：未登录 / 未配置输出目录 / 正在同步 → 不尝试；整体限时，
+  // 超时或失败都**不阻断提问**（只是不带本地笔记，并在消息里向 AI 说明原因）。
+  const ASK_IMPORT_TIMEOUT_MS = 15_000;
+  const ASK_IMPORT_SKIP_TEXT = {
+    'not-logged-in': '插件未登录',
+    'no-notes': '这本书在微信读书里还没有划线或想法',
+    'no-output-path': '未配置笔记保存路径',
+    busy: '后台正在同步，稍后再问即可带上',
+    timeout: '同步超时，稍后再问即可带上',
+    error: '同步失败，稍后再问即可带上',
+  };
+  const importBookForAsk = async (bookId, accountId, title) => {
+    const skip = (reason) => ({ imported: false, reason, reasonText: ASK_IMPORT_SKIP_TEXT[reason] ?? '同步未完成，稍后再问即可带上' });
+    if (!loginState.loggedIn) return skip('not-logged-in');
+    if (!config().outputPath) return skip('no-output-path');
+    if (sync.isSyncingInProgress(accountId)) return skip('busy');
+    let timer;
+    try {
+      const timeoutP = new Promise((res) => { timer = setTimeout(() => res(skip('timeout')), ASK_IMPORT_TIMEOUT_MS); timer.unref?.(); });
+      const r = await Promise.race([sync.importBook(bookId, accountId, { fallbackTitle: title }), timeoutP]);
+      return r.imported ? r : skip(r.reason ?? 'error');
+    } catch (e) {
+      logOp('WARN', `reader-ask 即时导入失败：${e?.message || e}`);
+      return skip('error');
+    } finally { clearTimeout(timer); }
+  };
   const readerWindow = createReaderWindow({
     stateDir,
     log: logOp,
@@ -250,7 +287,10 @@ export function apply(ctx, rawConfig = {}) {
       // v1.7.6 会话互通：窗内 skey 与插件不同时服务端裁决（死→换血注入，活→上报宿主）
       checkSession: ({ wrVid, wrSkey }) => checkSessionByHeaders(wrVid, wrSkey),
       // v1.7.6 反向同步 + v1.8.10 登录弹层共享（adoptWindowSession 见上方）
-      onWindowSession: (s) => { void adoptWindowSession(s); },
+      // v1.9.14：返回 Promise——上报方（回流守护/弹层核验）可等待采纳落账；调用方自行 void 即 fire-and-forget
+      onWindowSession: (s) => adoptWindowSession(s),
+      // v1.9.17：会话快照（滚动）——回流守护每次见到窗内有效会话即记一笔，供窗口不在场时恢复
+      saveSessionSnapshot: (snap) => { try { store.saveSessionSnapshot(undefined, snap); } catch { /* 快照失败不影响回流 */ } },
       // v1.7.7 选中即问：阅读窗口「问 DSH」队列项 → 解析本地书 → followup 唤醒会话作答。
       // 差异化（vs 微信读书自带 AI问书）：以本地笔记为据、带用户划线上下文、要求标章节出处、
       // 引其他书必须标明书名（实测官方 AI问书会把其他书内容当本书内容作答，chatid=search_entrance）。
@@ -269,17 +309,43 @@ export function apply(ctx, rawConfig = {}) {
           // v1.7.10：双通道取 agents 服务（inject 声明的 ctx.agents 优先，ctx.get 兜底）——
           // 首版真机失败无日志，此路径全部留痕
           const agentsSvc = ctx.agents ?? (typeof ctx.get === 'function' ? ctx.get('agents') : undefined);
-          const roots = agentsSvc?.roots?.() ?? [];
+          // v1.9.17 真机回归修复：原只从 roots()（顶层 agent，owner===undefined）取会话。当前活跃会话
+          // 常常不是顶层 root（由桌面端的持有关系创建）→ roots 为空 → 误报「没有活跃的 DSH 会话」，
+          // 而用户明明开着会话。宿主自己的 session-controller 是按 id agents.get()，不受影响。
+          // 现：roots 优先（保持既有「取顶层会话」语义）；roots 里没有可用的，再回退 list()（全部活跃 agent）。
+          const pickUsable = (cands) => {
+            for (let i = cands.length - 1; i >= 0; i--) { // 从最新的往前找
+              const a = cands[i];
+              if (a && typeof a.followup === 'function' && a.status !== 'disposed') return a;
+            }
+            return undefined;
+          };
           if (!agentsSvc) { const m = 'DSH 会话服务不可用（ctx.agents/ctx.get 均无）'; diag(false, m, -1); return { ok: false, msg: m }; }
-          const agent = roots[roots.length - 1];
-          if (!agent || typeof agent.followup !== 'function') { const m = '没有活跃的 DSH 会话（先打开/唤醒 DSH 对话再试）'; diag(false, m, roots.length); return { ok: false, msg: m }; }
+          const rootsRaw = agentsSvc?.roots?.() ?? [];
+          const agent = pickUsable(rootsRaw) ?? pickUsable(agentsSvc?.list?.() ?? []);
+          if (!agent) { const m = '没有活跃的 DSH 会话（先打开/唤醒 DSH 对话再试）'; diag(false, m, rootsRaw.length); return { ok: false, msg: m }; }
           const accountId = store.getActiveAccountId() ?? undefined;
           const pageBook = String(item.book || '').split(' - ')[0].trim();
-          const books = await index.queryBooks(accountId).catch(() => []);
-          const hit = books.find((b) => String(b.title || '') === pageBook)
-            ?? books.find((b) => pageBook && String(b.title || '').includes(pageBook))
-            ?? books.find((b) => b.title && pageBook.includes(String(b.title)));
+          // v1.9.19：优先按页面 URL 里的 bookId **精确**匹配（页面实时带来，零额外请求）；
+          // 取不到或没命中，再按书名模糊匹配（原行为）。真机：书名带「（全集）」这类后缀的
+          // 不同版本的书，按书名极易错配或漏配。
+          const pageBookId = typeof api.extractReaderBookId === 'function' ? api.extractReaderBookId(item.url) : '';
+          let hit = pageBookId ? await index.getBookById(pageBookId, accountId).catch(() => null) : null;
+          if (!hit) {
+            const books = await index.queryBooks(accountId).catch(() => []);
+            hit = books.find((b) => String(b.title || '') === pageBook)
+              ?? books.find((b) => pageBook && String(b.title || '').includes(pageBook))
+              ?? books.find((b) => b.title && pageBook.includes(String(b.title)));
+          }
           const ctxLines = [];
+          // v1.9.19：本地库没有这本书 → 即时导入（用户确认的方案 A）。无论成败都向 AI 说明情况：
+          // 原先此时消息里只字未提，AI 只能回答「本地笔记库里没有这本书」。
+          if (!hit && pageBookId) {
+            const imp = await importBookForAsk(pageBookId, accountId, pageBook);
+            if (imp.imported) hit = await index.getBookById(pageBookId, accountId).catch(() => null);
+            if (hit) ctxLines.push(`本书此前不在本地笔记库，已即时同步 ${imp.notesCount} 条笔记`);
+            else ctxLines.push(`本书不在本地笔记库（${imp.reasonText}），没有本地笔记可引——请基于通用知识回答，并明确注明并非出自本地笔记`);
+          }
           if (hit) {
             ctxLines.push(`本地笔记：bookId=${hit.bookId}${hit.localFilePath ? `，笔记文件=${hit.localFilePath}` : ''}（可用 weread 工具 notes/ask 动作查全书）`);
             try {
@@ -307,7 +373,7 @@ export function apply(ctx, rawConfig = {}) {
             agent.followup(message);
           } catch (e) {
             const m = `followup 投递异常：${e?.message || e}`;
-            diag(false, m, roots.length);
+            diag(false, m, rootsRaw.length);
             return { ok: false, msg: '推送会话失败（详见插件日志）' };
           }
           // v1.7.13：回执标明送达了哪个会话（多会话并行时用户不再找不到答案）
@@ -315,7 +381,7 @@ export function apply(ctx, rawConfig = {}) {
           let destTitle = '';
           try { destTitle = titlesSvc?.get?.(agent.session) || ''; } catch { /* 无标题服务即省略 */ }
           const destLabel = destTitle ? `「${String(destTitle).slice(0, 24)}」` : ` ${String(agent.id ?? '').slice(0, 10)} `;
-          diag(true, `已推送会话 ${String(agent.id ?? '').slice(0, 10)}（${destTitle || '无标题'}）（《${hit?.title ?? pageBook}》）`, roots.length);
+          diag(true, `已推送会话 ${String(agent.id ?? '').slice(0, 10)}（${destTitle || '无标题'}）（《${hit?.title ?? pageBook}》）`, rootsRaw.length);
           logOp('INFO', `reader-ask ${lastReaderAskDiag.msg}`);
           return { ok: true, msg: `已送达 DSH${destLabel}，回答见该会话` };
         } catch (e) {
@@ -444,10 +510,25 @@ export function apply(ctx, rawConfig = {}) {
   // v1.9.0 C2：凭据失效时的窗内会话救活——exportWindowSession + adoptWindowSession 复用
   // （弹层核验 v1.8.10 同款逻辑搬到启动/同步复核路径）。窗口关着时 export 秒回 null（零成本）；
   // 窗口在场（孤儿实例/用户正读着）时窗内会话往往比插件凭据新——救活免重扫码。
+  // v1.9.16 回退 v1.9.15 的「后台静默拉起」（probeSessionSilently）：它用同一 profile 再起一个
+  // Chrome 实例，而 Chrome 对同一 user-data-dir 是**单实例**——实际效果是在用户正在用的窗口里
+  // 打开首页、改写其会话，且会在启动校验之后把登录态置真。真机上造成「扫码后一分钟内失效」
+  // 与「问 DSH」弹条消失（详见 CHANGELOG 1.9.16）。
+  // v1.9.17「窗口没开也能恢复」改用**会话快照**：阅读窗口在场时滚动记录「最近一次见到的有效会话」
+  // （存 secrets.json，0600），窗口不在场时用它恢复。不另起进程、不触碰用户窗口。
+  // 快照与窗内会话走同一个 adoptWindowSession——自带服务端裁决与账号保护：过期快照会被判死而
+  // 不被采纳，绝不把死会话写进凭据；账号不匹配同样拒绝。
+  // 保留 v1.9.15 的两项有效改进：① 30min 复检判死先救活；② 同步前复核 await 救活结果。
   const tryRescueFromWindow = async (reason) => {
     try {
-      if (loginState.loggedIn && !loginState.expired) return false;
-      const winSession = await readerWindow.exportWindowSession?.().catch(() => null);
+      if (loginState.loggedIn && !loginState.expired) return false; // 未失效：不救
+      // 来源一：窗口在场，直接读（最新）
+      let winSession = await readerWindow.exportWindowSession?.().catch(() => null);
+      // 来源二：窗口不在场 → 用快照（「最近一次见到的会话」）。按账号隔离。
+      if (!winSession) {
+        const snap = store.getSessionSnapshot?.();
+        if (snap) { winSession = { wrVid: snap.wrVid, wrSkey: snap.wrSkey }; logOp('INFO', `reader-window 窗口不在场，改用会话快照恢复（${reason}，快照年龄 ${Math.round((Date.now() - snap.savedAt) / 60000)} 分钟）`); }
+      }
       if (!winSession) return false;
       const adopted = await adoptWindowSession(winSession);
       if (adopted) logOp('INFO', `reader-window 插件凭据失效，已从窗内会话救活（${reason}）——免重扫码`);
@@ -465,10 +546,12 @@ export function apply(ctx, rawConfig = {}) {
       const ok = await auth.verifyNow();
       if (ok === true) { loginState.loggedIn = true; loginState.expired = false; markApiHealth(true); }
       else if (ok === false) {
+        // v1.9.15：先救活、后定性——原实现先置 expired=true 再 fire-and-forget 救活，
+        // 当前这次请求已按「未登录」处理（401），横幅先闪一下即使救活随后成功。
+        // 现 await 救活完成：成功则本次同步照常进行；失败才置过期。
+        const rescued = await tryRescueFromWindow('sync-verify');
+        if (rescued) { loginState.loggedIn = true; loginState.expired = false; return; }
         loginState.loggedIn = false; loginState.expired = true;
-        // v1.9.0 C2：凭据判死时尝试从阅读窗口救活（窗口在场=用户可能刚在窗内活跃过；
-        // 窗口关着则 export 秒回 null，零成本）。采纳成功会广播登录态，本函数下次复核即转绿。
-        void tryRescueFromWindow('sync-verify');
       }
       // null（网络异常）：保持现状，交由 apiHealth 降级路径
     } catch { /* ignore */ }
@@ -484,6 +567,12 @@ export function apply(ctx, rawConfig = {}) {
       const raw = auth.getLastRawCheck?.();
       if (ok) {
         const expired = raw?.ok === false; // 管理器宽限 true 但底层 API 已判无效
+        // v1.9.15：判死先救活。30min 复检是最高频的判死入口——原实现直接置 expired=true，
+        // 「登录已过期」横幅由此出现，而此刻阅读窗口的持久 profile 里往往还有活会话。
+        if (expired) {
+          const rescued = await tryRescueFromWindow('recheck');
+          if (rescued) { loginState.loggedIn = true; loginState.expired = false; markApiHealth(true); return; }
+        }
         loginState.loggedIn = !expired;
         loginState.expired = expired;
         if (!expired) markApiHealth(true);
@@ -924,7 +1013,7 @@ export function apply(ctx, rawConfig = {}) {
     reg({
       name: 'weread-roaming',
       description: '微信读书：抽一张笔记漫游卡片',
-      input: { hint: '可选：书名/作者关键词（如 程苓峰），留空全池随机' },
+      input: { hint: '可选：书名/作者关键词（如 小说、历史），留空全池随机' },
       async handler(inv) {
         const kw = String(inv?.rawInput ?? '').trim();
         const acc = store.getActiveAccountId() ?? undefined;
@@ -1091,17 +1180,60 @@ export function apply(ctx, rawConfig = {}) {
       // v1.1 官方通道（API Key）状态：绑定态/尾号/版本/升级提示 + 最近一次对账
       gateway: (() => {
         const key = (() => { try { return store.getApiKey(); } catch { return undefined; } })();
+        const eff = effectiveSkillVersion();
+        // v1.9.19：升级提示只在「服务端最新版 > 当前生效版本」时才算数——否则升级完还会一直挂着旧提示
+        const info = gateway.lastUpgradeInfo?.()?.info ?? null;
+        const latest = info ? String(info.latest_version ?? '').replace(/^v/, '') : '';
+        const up = info && ((compareSemver(latest, eff) ?? 1) > 0) ? { info } : null;
         return {
           enabled: !!key,
           keyTail: apiKeyTail(key),
-          skillVersion: SKILL_VERSION,
-          upgrade: gateway.lastUpgradeInfo?.() ?? null,
+          skillVersion: eff, // 当前生效（可能是插件内升级后的值）
+          bundledSkillVersion: SKILL_VERSION, // 内置常量
+          skillVersionOverridden: eff !== SKILL_VERSION,
+          upgrade: up,
         };
       })(),
     };
   };
 
   let apiEndpointSaved = false;
+  // v1.9.19 Skill 升级：并发保护 + 下载（流式读取、超时、体积上限、落地主机复核）
+  let skillUpgradeInFlight = false;
+  const downloadWithCap = async (url, maxBytes, timeoutMs) => {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      const resp = await fetch(url, { signal: ctrl.signal });
+      // 跟随了跳转时，最终落地的主机仍须在白名单内
+      const finalUrl = typeof resp.url === 'string' && resp.url ? resp.url : url;
+      if (!isAllowedSkillUpgradeUrl(finalUrl)) throw new Error('升级包地址不在官方 CDN 白名单内');
+      if (!resp.ok) throw new Error(`下载升级包失败（HTTP ${resp.status}）`);
+      const declared = Number(resp.headers?.get?.('content-length'));
+      if (Number.isFinite(declared) && declared > maxBytes) throw new Error('升级包超出大小上限');
+      if (!resp.body || typeof resp.body.getReader !== 'function') {
+        const ab = await resp.arrayBuffer();
+        if (ab.byteLength > maxBytes) throw new Error('升级包超出大小上限');
+        return Buffer.from(ab);
+      }
+      const reader = resp.body.getReader();
+      const chunks = [];
+      let got = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        got += value.byteLength;
+        if (got > maxBytes) { try { await reader.cancel(); } catch { /* ignore */ } throw new Error('升级包超出大小上限'); }
+        chunks.push(Buffer.from(value));
+      }
+      return Buffer.concat(chunks);
+    } catch (e) {
+      if (e?.name === 'AbortError') throw new Error('下载升级包超时');
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
   // v1.9.11 宿主调用方认证（dshopen #522 审核要求）：本机任意进程都能匿名访问 loopback 的
   // /weread/api（含读取完整 API Key 与私人笔记的接口）——插件账号已登录不代表请求来自宿主
   // 所有者。双通道收口：
@@ -1467,6 +1599,48 @@ export function apply(ctx, rawConfig = {}) {
           }
         }
         // v1.1：官方网关自检（ping + /_list）——真机字段验证闸门（roadmap §8A Go/No-Go）
+        // v1.9.19 官方 Skill 一键升级：下载官方升级包 → 只读出 SKILL.md 的版本号 → 切换 → 连通性验证 → 失败回滚。
+        // 插件不运行 Skill（它只是给 AI 看的接口说明），所谓升级 = 换掉每次请求携带的 skill_version。
+        if (method === 'POST' && pathname === '/weread/api/gateway/skill-upgrade') {
+          const key = (() => { try { return store.getApiKey(); } catch { return undefined; } })();
+          if (!key) return sendJson(res, 400, { ok: false, error: '未绑定 API Key（Skill 版本随官方通道请求上报，绑定后才有升级一说）' });
+          if (skillUpgradeInFlight) return sendJson(res, 409, { ok: false, error: '升级正在进行中，请稍候' });
+          const info = gateway.lastUpgradeInfo()?.info ?? null;
+          // 地址来源：服务端回包的 upgrade_url（须过白名单）；没有或不可信时用内置官方地址
+          const url = info && isAllowedSkillUpgradeUrl(info.upgrade_url) ? String(info.upgrade_url) : DEFAULT_SKILL_ZIP_URL;
+          const from = effectiveSkillVersion();
+          const prevPref = prefs.skillVersion;
+          skillUpgradeInFlight = true;
+          try {
+            const buf = await downloadWithCap(url, SKILL_ZIP_MAX_BYTES, 20_000);
+            const to = extractSkillVersionFromZip(buf);
+            if (!to) return sendJson(res, 502, { ok: false, error: '升级包里读不到 Skill 版本号（包结构可能已变化）' });
+            const cmp = compareSemver(to, from);
+            if (cmp === 0) return J({ ok: true, changed: false, version: to, skillVersion: to });
+            if (cmp === null || cmp < 0) return sendJson(res, 400, { ok: false, error: `升级包版本（v${to}）不高于当前（v${from}），未做改动` });
+            prefs = { ...prefs, skillVersion: to };
+            writePrefs(prefs);
+            syncGatewayKey();
+            // 切换后用新版本号打一次最小请求：服务端若不接受新版本，立即回滚，不让插件停在坏版本上
+            try {
+              await gateway.ping();
+            } catch (e) {
+              const restored = { ...prefs };
+              if (prevPref === undefined) delete restored.skillVersion; else restored.skillVersion = prevPref;
+              prefs = restored;
+              writePrefs(prefs);
+              logOp('WARN', `gateway: Skill 切到 v${to} 后连通性验证失败，已回退到 v${from}：${e?.message || e}`);
+              return sendJson(res, 502, { ok: false, error: `切换到 v${to} 后官方通道验证失败，已回退到 v${from}：${e?.message || e}`, rolledBack: true });
+            }
+            logOp('INFO', `gateway: 官方 Skill 已升级 v${from} → v${to}（连通性验证通过）`);
+            return J({ ok: true, changed: true, from, to, skillVersion: to });
+          } catch (e) {
+            logOp('WARN', `gateway: Skill 升级失败：${e?.message || e}`);
+            return sendJson(res, 502, { ok: false, error: `升级失败：${e?.message || e}` });
+          } finally {
+            skillUpgradeInFlight = false;
+          }
+        }
         if (method === 'POST' && pathname === '/weread/api/gateway/test') {
           const key = (() => { try { return store.getApiKey(); } catch { return undefined; } })();
           if (!key) return sendJson(res, 400, { error: '未绑定 API Key（先在登录弹层用 API Key 登录或绑定）' });
@@ -1478,7 +1652,7 @@ export function apply(ctx, rawConfig = {}) {
             try { apis = await gateway.listApis(); } catch (e) { apis = { error: e.message }; }
             const list = Array.isArray(apis) ? apis : undefined;
             logOp('INFO', `gateway.test ok latency=${Date.now() - t0}ms apiCount=${list?.length ?? 'n/a'}`);
-            return J({ ok: true, latencyMs: Date.now() - t0, skillVersion: SKILL_VERSION, apiCount: list?.length, apis: list ? list.slice(0, 50) : apis });
+            return J({ ok: true, latencyMs: Date.now() - t0, skillVersion: gateway.skillVersion(), apiCount: list?.length, apis: list ? list.slice(0, 50) : apis });
           } catch (e) {
             markApiHealth(false, `官方网关：${e.message}`);
             return J({ ok: false, error: e.message, latencyMs: Date.now() - t0 });
@@ -1522,8 +1696,19 @@ export function apply(ctx, rawConfig = {}) {
           // 先采纳窗内会话（同源校验+账号匹配+服务端裁决），再复核呈现真实状态。
           // 场景：窗内扫码登录过、插件侧 cookie 旧死 → 弹层不再误报「已过期」。
           if (v !== true) {
+            // v1.9.14：弹层未登录时每 3s 重核（延迟源 A 修复）——窗内会话探测须节流，否则
+            // 「窗内会话裁决网络异常（不进 1h 拒绝冷却）」这一支会每 3s 打一次裸接口。
+            // 同指纹 10s 内不重复探测；采纳成功后 v===true 不再进入本分支，节流自然失效。
             const winSession = await readerWindow.exportWindowSession?.().catch(() => null);
-            if (winSession) await adoptWindowSession(winSession);
+            if (winSession) {
+              const fp = `${winSession.wrVid}|${winSession.wrSkey}`;
+              const last = verifyAdoptProbeAt.get(fp) ?? 0;
+              if (Date.now() - last >= 10_000) {
+                if (verifyAdoptProbeAt.size >= 32) verifyAdoptProbeAt.delete(verifyAdoptProbeAt.keys().next().value);
+                verifyAdoptProbeAt.set(fp, Date.now());
+                await adoptWindowSession(winSession);
+              }
+            }
             v = await auth.verifyNow().catch(() => null);
           }
           // v1.9.1 修复状态分裂：核验结论同步回 loginState——弹层显示「有效」而书架横幅
@@ -1789,6 +1974,7 @@ export function apply(ctx, rawConfig = {}) {
               'POST /weread/api/login/apikey {apiKey}': 'API Key 官方通道登录（已登录=绑定当前账号）',
               'POST /weread/api/gateway/test': '官方网关自检（ping + /_list，验证闸门）',
               'POST /weread/api/gateway/unbind': '解绑当前账号的 API Key',
+              'POST /weread/api/gateway/skill-upgrade': '官方 Skill 一键升级（下载官方包→读版本号→切换→验证，失败回滚）',
               'POST /weread/api/login/verify': '实时核验各登录通道有效状态',
               'GET /weread/api/gateway/stats?mode=weekly|monthly|annually|overall': '官方阅读统计（v1.3）',
               'GET /weread/api/gateway/progress?bookId=': '精确阅读进度（v1.3）',
@@ -1860,11 +2046,19 @@ export function apply(ctx, rawConfig = {}) {
   }
 
   // ---------- A3: 凭据优先存 macOS Keychain（符合设备级约定，失败回退文件） ----------
-  const keychainEnabled = process.platform === 'darwin' && prefs.keychain !== false;
+  // v1.9.16 测试注入口（对齐 readerDeps 惯例）：keychainDeps.run 替换 `security` 调用，
+  // 使补水/镜像逻辑可在不触碰真实钥匙串的前提下被测。**只替换「去哪读写」，
+  // 不改镜像逻辑本身**；生产不传，走真实 /usr/bin/security。
+  const keychainDeps = rawConfig.keychainDeps && typeof rawConfig.keychainDeps === 'object' ? rawConfig.keychainDeps : null;
+  const keychainEnabled = keychainDeps
+    ? prefs.keychain !== false // 注入在场：忽略平台判定（CI多为 linux），仍尊重用户开关
+    : process.platform === 'darwin' && prefs.keychain !== false;
   const kcService = 'dsh-weread';
-  const kcRun = (args) => new Promise((resolve) => {
-    execFile('/usr/bin/security', args, { timeout: 5000 }, (err, stdout) => resolve(err ? null : stdout));
-  });
+  const kcRun = keychainDeps && typeof keychainDeps.run === 'function'
+    ? (args) => Promise.resolve(keychainDeps.run(args)).catch(() => null)
+    : (args) => new Promise((resolve) => {
+      execFile('/usr/bin/security', args, { timeout: 5000 }, (err, stdout) => resolve(err ? null : stdout));
+    });
   if (keychainEnabled) {
     const kcAccountId = (id) => id || store.getActiveAccountId() || 'default';
     const kcApiKeyService = 'dsh-weread-apikey';
@@ -1892,14 +2086,25 @@ export function apply(ctx, rawConfig = {}) {
       origClearKey(accountId);
       void kcRun(['delete-generic-password', '-s', kcApiKeyService, '-a', kcAccountId(accountId)]);
     };
-    // 启动补水：文件无凭据而 Keychain 有 → 恢复到文件（保持同步读路径）
+    // 启动补水：文件无**有效会话**而 Keychain 有 → 恢复到文件（保持同步读路径）
+    // v1.9.16：原判定 `!store.getCookies(id)`——空壳（wr_vid=; wr_skey=）是非空字符串，被判「有凭据」
+    // → 跳过恢复。真机现场：文件是空壳、钥匙串里存着好凭据，坏的那份因此长期得不到修复。
+    // 现以「是否构成完整会话（vid 与 skey 均有值）」为准；恢复值同样须通过该判定才落盘——
+    // 钥匙串里若也是空壳，不得把它写回文件。
+    const hasCompleteSession = (cookieString) => {
+      const s = String(cookieString ?? '');
+      const pick = (name) => { const m = new RegExp(`(?:^|;\\s*)${name}=([^;]*)`).exec(s); return m ? m[1].trim() : ''; };
+      return !!pick('wr_vid') && !!pick('wr_skey');
+    };
+    let hydratedValidSession = false; // 补水后是否持有**完整会话**（供下方登录态预置使用）
     void (async () => {
       try {
         const ids = ['default', ...store.listAccounts().map((a) => a.accountId)];
         for (const id of ids) {
-          if (!store.getCookies(id)) {
+          if (!hasCompleteSession(store.getCookies(id))) {
             const out = await kcRun(['find-generic-password', '-s', kcService, '-a', id, '-w']);
-            if (out && out.trim()) { origSave(id, out.trim()); logOp('INFO', `credentials: 从 Keychain 恢复账号 ${id} 的 cookie`); }
+            // v1.9.16：恢复值也须是完整会话才落盘——不把空壳从钥匙串搬回文件
+            if (out && hasCompleteSession(out.trim())) { origSave(id, out.trim()); logOp('INFO', `credentials: 从 Keychain 恢复账号 ${id} 的 cookie`); }
           }
           if (!store.getApiKey(id)) {
             const outKey = await kcRun(['find-generic-password', '-s', kcApiKeyService, '-a', id, '-w']);
@@ -1909,8 +2114,17 @@ export function apply(ctx, rawConfig = {}) {
         const cookies = store.getCookies();
         if (cookies) api.apiClient.setCookies(cookies);
         syncGatewayKey();
-        if (cookies || store.getApiKey()) loginState.loggedIn = true;
+        hydratedValidSession = hasCompleteSession(cookies) || !!store.getApiKey();
       } catch { /* ignore */ }
+      // v1.9.16：登录态预置不再在此处无条件置真。原 `if (cookies || apiKey) loginState.loggedIn = true`
+      // 是异步的，会在启动校验**判死之后**执行，把结论覆盖回「已登录」（实测 +53ms 覆盖），
+      // 使已失效凭据在下次复检前显示为已登录。现仅当确实持有完整会话/Key、且校验尚未得出
+      // 「已失效」结论时才预置——校验结果优先。
+      if (hydratedValidSession) {
+        if (!loginState.loggedIn && !loginState.expired) loginState.loggedIn = true;
+      } else if (!store.getCookies() && !store.getApiKey()) {
+        loginState.loggedIn = false;
+      }
     })();
     logOp('INFO', 'credentials: macOS Keychain mirror enabled (cookies + apikey, fallback secrets.json)');
   }
@@ -1948,7 +2162,7 @@ export function apply(ctx, rawConfig = {}) {
           `登录态：${loginState.loggedIn && acc.id ? `已登录（${acc.name ?? acc.id}）` : '未登录'}`,
           `账号：${acc.accounts.map((a) => `${a.name}${a.id === acc.id ? '(活跃)' : ''}`).join('、') || '无'}`,
           ...(apiKey
-            ? [`官方通道：API Key 已绑定（尾号 ${apiKeyTail(apiKey)}，skill v${SKILL_VERSION}）`]
+            ? [`官方通道：API Key 已绑定（尾号 ${apiKeyTail(apiKey)}，skill v${effectiveSkillVersion()}）`]
             : ['官方通道：未绑定 API Key（可选；绑定后同步走官方网关并启用对账）']),
           `输出目录：${cfg.outputPath || '未配置'}（校验：${validationView().summary}）`,
           `本地书籍：${booksCount} 本`,

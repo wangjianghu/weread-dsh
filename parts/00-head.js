@@ -70,12 +70,29 @@ window.__ModuleLoader__.load({
       else onToast(r?.error || W.t.openReaderFail);
     };
 
+    // v1.9.20：同步对账「计数不一致」提示按差异方向说话。方向判断只写这一份，各语言表只提供句子。
+    // 优先用宿主给的**全量**方向计数——明细只保留差值最大的 50 条，按样本判断方向会把少量的「漏采」说成
+    // 「全是本地偏多」；旧宿主没有计数时退回按明细样本判断；两者都没有则保持原文案。
+    W.reconcileBad = (s, rec) => {
+      const rows = Array.isArray(rec?.mismatched) ? rec.mismatched : [];
+      const full = Number.isFinite(rec?.localHigherCount) && Number.isFinite(rec?.localLowerCount);
+      if (!full && !rows.length) return s.legacy;
+      const more = full ? rec.localHigherCount : rows.filter((x) => x.local > x.expected).length;
+      const less = full ? rec.localLowerCount : rows.length - more;
+      if (less === 0) return s.allHigher(s.head);
+      if (more === 0) return s.allLower(s.head);
+      return s.mixed(s.head, less, more);
+    };
+
     // ---------- 文案（zh） ----------
     W.t = {
       panel: '微信读书',
       bookshelf: '书架', insights: '洞察', roaming: '漫游', settings: '设置',
       detail: '笔记详情',
       login: '登录微信读书', loginProtocol: '扫码登录', loginCookie: '粘贴 Cookie 登录',
+      // v1.9.14：已登录时弹层不再显示二维码/Cookie 输入（避免重复登录），改为明确提示
+      alreadyLoggedIn: '当前已登录', alreadyLoggedInHint: '无需重复登录。阅读窗口里扫码登录后，登录态会自动同步到这里。',
+      loginSwitchAccount: '仍要登录其他账号', loginSwitchAccountHint: '仅在需要切换/新增账号时使用',
       logout: '登出', sync: '同步笔记', syncing: '同步中…', syncDone: '同步完成', syncFailed: '同步失败',
       search: '搜索书架', searchNotes: '搜索笔记', clearFilter: '清除筛选',
       collapseAll: '全部折叠', expandAll: '全部展开',
@@ -166,7 +183,13 @@ window.__ModuleLoader__.load({
       gatewayOk: '官方网关连通',
       gatewayReconcile: '同步对账',
       gatewayReconcileOk: (n) => `${n} 本书与服务端计数一致`,
-      gatewayReconcileBad: (n, m) => `${m}/${n} 本计数不一致（可能漏采，点击详情排查）`,
+      gatewayReconcileBad: (n, m, rec) => W.reconcileBad({
+        legacy: `${m}/${n} 本计数不一致（可能漏采，点击详情排查）`,
+        head: `${m}/${n} 本计数不一致`,
+        allHigher: (head) => `${head}（本地多于服务端：重复或手加的笔记；手加的保留，重复的会在后续同步中清理）`,
+        allLower: (head) => `${head}（可能漏采，点击详情排查）`,
+        mixed: (head, less, more) => `${head}（${less} 本可能漏采、${more} 本本地偏多，点击详情排查）`,
+      }, rec),
       delete: '删除', confirmDeleteBook: '确认删除该书的本地笔记文件？',
       openFolder: '在文件夹中显示', days: '天',
       exportThemes: '背景主题', timeCreate: '笔记创建时间', timeShare: '当前分享时间',
@@ -291,6 +314,7 @@ window.__ModuleLoader__.load({
       cleanupFinished: '清理完成', cleanupDoneLine: (p) => `清理完成${p ? `，清单：${p}` : ''}`, cleanupRunFailed: '清理失败',
       restoreDoneLine: (s) => (s ? `回滚完成：${s}` : '回滚完成'), restoreFailed: '回滚失败',
       logsLoadFailed: '读取日志失败', logsCleared: '日志已清空', clearFailed: '清空失败',
+      logsCopied: (n) => `已复制 ${n} 行日志`, logsCopyFailed: '复制失败（浏览器未授权剪贴板）', logsCopyTip: '复制当前已加载的日志',
       pickDirTip: '打开目录选择窗口', chooseStorage: '选择存储位置…', validateApply: '校验并应用',
       valStatus: (ok) => `状态：${ok ? '通过' : '失败'}`, valReason: (r) => `原因：${r}`, summaryLabel: (s) => `summary：${s}`,
       hoursOpt: (n) => `${n} 小时`,
@@ -321,7 +345,16 @@ window.__ModuleLoader__.load({
       bindApiKeyTip: '打开登录弹层（直达 API Key tab）', bindApiKey: '绑定 API Key',
       unboundOk: '已解绑 API Key（登录态不变）', unbindFailed: '解绑失败',
       gatewayTestOk: (ms, n) => `${W.t.gatewayOk}（${ms}ms${n ? `，可用接口 ${n} 个` : ''}）`,
-      failedWord: '失败', skillVersionTip: (s) => `官方 Skill 版本提示：${s}`,
+      failedWord: '失败',
+      // v1.9.19 官方 Skill 一键升级（替换原「原始 JSON 提示」）
+      skillUpgradeAvailable: (cur, latest) => `官方 Skill 有新版本 v${latest}（当前 v${cur}）`,
+      skillUpgradeBtn: '升级 Skill', skillUpgrading: '正在升级…',
+      skillUpgradeTip: '从微信读书官方 CDN 下载最新 Skill 说明包，读出版本号后切换。只读版本号，不运行任何内容。',
+      skillUpgraded: (v) => `官方 Skill 已升级到 v${v}`, skillAlreadyLatest: (v) => `官方 Skill 已是最新 v${v}`,
+      skillUpgradeFailed: (m) => `Skill 升级失败：${m}`,
+      // v1.9.20：界面热更新了、宿主进程还是旧版（没有升级路由，404 no route）——直说重启，不甩路由路径
+      skillUpgradeStaleHost: '界面已更新，但后台仍是旧版本（没有升级接口）——请重启 DeepSeek Harness 后再点「升级 Skill」',
+      skillUpgradedNote: (cur, bundled) => `当前生效 v${cur}（由插件内升级切过去；插件安装包自带的默认值是 v${bundled}，不影响使用）`,
       reconcileRow: (t, l, e) => `《${t}》 本地 ${l} / 服务端 ${e}`, reconcileMore: (n) => `\n… 共 ${n} 本`,
       dupCleanup: '重复文件清理', previewCleanupBtn: '预览清理结果', runConfirm: '确认执行', restoreCleanupBtn: '回滚上次清理',
       cleanupSummaryLine: (s, c, d, r) => `扫描 ${s} 个文件，冲突 ${c} 组，将迁移 ${d} 个重复文件，重命名 ${r} 个`,
@@ -357,6 +390,8 @@ window.__ModuleLoader__.load({
       panel: 'WeRead', bookshelf: 'Books', insights: 'Insights', roaming: 'Roam', settings: 'Settings',
       detail: 'Note Detail',
       login: 'Log in to WeRead', loginProtocol: 'Scan QR', loginCookie: 'Paste Cookie',
+      alreadyLoggedIn: 'Already logged in', alreadyLoggedInHint: 'No need to log in again. Scanning the QR code in the reader window syncs your session here automatically.',
+      loginSwitchAccount: 'Log in to another account anyway', loginSwitchAccountHint: 'Only for switching or adding an account',
       logout: 'Log out', sync: 'Sync notes', syncing: 'Syncing…', syncDone: 'Sync done', syncFailed: 'Sync failed',
       search: 'Search shelf', searchNotes: 'Search notes', clearFilter: 'Clear filter',
       collapseAll: 'Collapse all', expandAll: 'Expand all',
@@ -448,7 +483,13 @@ window.__ModuleLoader__.load({
       gatewayOk: 'Official gateway reachable',
       gatewayReconcile: 'Sync reconciliation',
       gatewayReconcileOk: (n) => `${n} books match server counts`,
-      gatewayReconcileBad: (n, m) => `${m}/${n} books mismatched (possible missing notes)`,
+      gatewayReconcileBad: (n, m, rec) => W.reconcileBad({
+        legacy: `${m}/${n} books mismatched (possible missing notes)`,
+        head: `${m}/${n} books mismatched`,
+        allHigher: (head) => `${head} (local higher than server: duplicated or hand-added notes; hand-added notes are kept, duplicates are cleaned up in later syncs)`,
+        allLower: (head) => `${head} (possible missing notes — click for details)`,
+        mixed: (head, less, more) => `${head} (possible missing notes in ${less}, local higher in ${more} — click for details)`,
+      }, rec),
       delete: 'Delete', confirmDeleteBook: 'Delete this book’s local note file?',
       openFolder: 'Reveal in folder', days: 'days',
       exportThemes: 'Theme', timeCreate: 'Note time', timeShare: 'Share time',
@@ -568,6 +609,7 @@ window.__ModuleLoader__.load({
       cleanupFinished: 'Cleanup done', cleanupDoneLine: (p) => `Cleanup done${p ? `, manifest: ${p}` : ''}`, cleanupRunFailed: 'Cleanup failed',
       restoreDoneLine: (s) => (s ? `Rolled back: ${s}` : 'Rolled back'), restoreFailed: 'Rollback failed',
       logsLoadFailed: 'Failed to read logs', logsCleared: 'Logs cleared', clearFailed: 'Clear failed',
+      logsCopied: (n) => `Copied ${n} log lines`, logsCopyFailed: 'Copy failed (clipboard not permitted)', logsCopyTip: 'Copy the currently loaded logs',
       pickDirTip: 'Open the folder picker', chooseStorage: 'Choose folder…', validateApply: 'Validate & apply',
       valStatus: (ok) => `Status: ${ok ? 'passed' : 'failed'}`, valReason: (r) => `Reason: ${r}`, summaryLabel: (s) => `summary: ${s}`,
       hoursOpt: (n) => `${n} hours`,
@@ -598,7 +640,14 @@ window.__ModuleLoader__.load({
       bindApiKeyTip: 'Open the login modal (API Key tab)', bindApiKey: 'Bind API Key',
       unboundOk: 'API Key unbound (login state unchanged)', unbindFailed: 'Unbind failed',
       gatewayTestOk: (ms, n) => `${W.t.gatewayOk} (${ms}ms${n ? `, ${n} APIs available` : ''})`,
-      failedWord: 'Failed', skillVersionTip: (s) => `Official skill version notice: ${s}`,
+      failedWord: 'Failed',
+      skillUpgradeAvailable: (cur, latest) => `Official Skill v${latest} available (current v${cur})`,
+      skillUpgradeBtn: 'Upgrade Skill', skillUpgrading: 'Upgrading…',
+      skillUpgradeTip: 'Downloads the latest Skill docs from the official WeRead CDN, reads the version and switches to it. Read-only: nothing is executed.',
+      skillUpgraded: (v) => `Official Skill upgraded to v${v}`, skillAlreadyLatest: (v) => `Official Skill is already at the latest v${v}`,
+      skillUpgradeFailed: (m) => `Skill upgrade failed: ${m}`,
+      skillUpgradeStaleHost: 'The UI was updated but the background host is still the old build (no upgrade endpoint) — restart DeepSeek Harness, then click "Upgrade Skill" again',
+      skillUpgradedNote: (cur, bundled) => `v${cur} in effect (switched by the in-plugin upgrade; the bundled default is v${bundled} — no impact on use)`,
       reconcileRow: (t, l, e) => `“${t}” local ${l} / server ${e}`, reconcileMore: (n) => `\n… ${n} total`,
       dupCleanup: 'Duplicate file cleanup', previewCleanupBtn: 'Preview cleanup', runConfirm: 'Confirm run', restoreCleanupBtn: 'Rollback last cleanup',
       cleanupSummaryLine: (s, c, d, r) => `Scanned ${s} files, ${c} conflict groups, ${d} duplicates to move, ${r} renamed`,
@@ -632,6 +681,8 @@ window.__ModuleLoader__.load({
       bookshelf: '書架', insights: '洞察', roaming: '漫遊', settings: '設定',
       detail: '筆記詳情',
       login: '登入微信讀書', loginProtocol: '掃碼登入', loginCookie: '貼上 Cookie 登入',
+      alreadyLoggedIn: '目前已登入', alreadyLoggedInHint: '無需重複登入。在閱讀視窗掃碼登入後，登入狀態會自動同步到這裡。',
+      loginSwitchAccount: '仍要登入其他帳號', loginSwitchAccountHint: '僅在需要切換/新增帳號時使用',
       logout: '登出', sync: '同步筆記', syncing: '同步中…', syncDone: '同步完成', syncFailed: '同步失敗',
       search: '搜尋書架', searchNotes: '搜尋筆記', clearFilter: '清除篩選',
       collapseAll: '全部摺疊', expandAll: '全部展開',
@@ -722,7 +773,13 @@ window.__ModuleLoader__.load({
       gatewayOk: '官方閘道連通',
       gatewayReconcile: '同步對帳',
       gatewayReconcileOk: (n) => `${n} 本書與服務端計數一致`,
-      gatewayReconcileBad: (n, m) => `${m}/${n} 本計數不一致（可能漏採，點擊詳情排查）`,
+      gatewayReconcileBad: (n, m, rec) => W.reconcileBad({
+        legacy: `${m}/${n} 本計數不一致（可能漏採，點擊詳情排查）`,
+        head: `${m}/${n} 本計數不一致`,
+        allHigher: (head) => `${head}（本地多於服務端：重複或手加的筆記；手加的保留，重複的會在後續同步中清理）`,
+        allLower: (head) => `${head}（可能漏採，點擊詳情排查）`,
+        mixed: (head, less, more) => `${head}（${less} 本可能漏採、${more} 本本地偏多，點擊詳情排查）`,
+      }, rec),
       delete: '刪除', confirmDeleteBook: '確認刪除該書的本地筆記檔案？',
       openFolder: '在資料夾中顯示', days: '天',
       exportThemes: '背景主題', timeCreate: '筆記建立時間', timeShare: '目前分享時間',
@@ -842,6 +899,7 @@ window.__ModuleLoader__.load({
       cleanupFinished: '清理完成', cleanupDoneLine: (p) => `清理完成${p ? `，清單：${p}` : ''}`, cleanupRunFailed: '清理失敗',
       restoreDoneLine: (s) => (s ? `還原完成：${s}` : '還原完成'), restoreFailed: '還原失敗',
       logsLoadFailed: '讀取日誌失敗', logsCleared: '日誌已清空', clearFailed: '清空失敗',
+      logsCopied: (n) => `已複製 ${n} 行日誌`, logsCopyFailed: '複製失敗（瀏覽器未授權剪貼簿）', logsCopyTip: '複製目前已載入的日誌',
       pickDirTip: '開啟目錄選擇視窗', chooseStorage: '選擇儲存位置…', validateApply: '校驗並套用',
       valStatus: (ok) => `狀態：${ok ? '通過' : '失敗'}`, valReason: (r) => `原因：${r}`, summaryLabel: (s) => `summary：${s}`,
       hoursOpt: (n) => `${n} 小時`,
@@ -872,7 +930,14 @@ window.__ModuleLoader__.load({
       bindApiKeyTip: '開啟登入彈層（直達 API Key tab）', bindApiKey: '綁定 API Key',
       unboundOk: '已解綁 API Key（登入狀態不變）', unbindFailed: '解綁失敗',
       gatewayTestOk: (ms, n) => `${W.t.gatewayOk}（${ms}ms${n ? `，可用介面 ${n} 個` : ''}）`,
-      failedWord: '失敗', skillVersionTip: (s) => `官方 Skill 版本提示：${s}`,
+      failedWord: '失敗',
+      skillUpgradeAvailable: (cur, latest) => `官方 Skill 有新版本 v${latest}（目前 v${cur}）`,
+      skillUpgradeBtn: '升級 Skill', skillUpgrading: '升級中…',
+      skillUpgradeTip: '從微信讀書官方 CDN 下載最新 Skill 說明包，讀出版本號後切換。唯讀版本號，不執行任何內容。',
+      skillUpgraded: (v) => `官方 Skill 已升級到 v${v}`, skillAlreadyLatest: (v) => `官方 Skill 已是最新 v${v}`,
+      skillUpgradeFailed: (m) => `Skill 升級失敗：${m}`,
+      skillUpgradeStaleHost: '介面已更新，但背景仍是舊版本（沒有升級介面）——請重新啟動 DeepSeek Harness 後再點「升級 Skill」',
+      skillUpgradedNote: (cur, bundled) => `目前生效 v${cur}（由外掛內升級切過去；安裝包自帶的預設值是 v${bundled}，不影響使用）`,
       reconcileRow: (t, l, e) => `《${t}》 本地 ${l} / 服務端 ${e}`, reconcileMore: (n) => `\n… 共 ${n} 本`,
       dupCleanup: '重複檔案清理', previewCleanupBtn: '預覽清理結果', runConfirm: '確認執行', restoreCleanupBtn: '還原上次清理',
       cleanupSummaryLine: (s, c, d, r) => `掃描 ${s} 個檔案，衝突 ${c} 組，將遷移 ${d} 個重複檔案，重新命名 ${r} 個`,
@@ -995,6 +1060,8 @@ window.__ModuleLoader__.load({
         key: (sz = 12) => svg(sz, '0 0 24 24', circ(8, 15, 4, 'a'), line(10.8, 12.2, 20, 3, 'b'), line(16.5, 6.5, 19.5, 9.5, 'c'), line(14, 9, 16.5, 11.5, 'd')),
         terminal: (sz = 12) => svg(sz, '0 0 24 24', rect(3, 4.5, 18, 15, 1.5, 'a'), line(6.5, 9.5, 9.5, 12.5, 'b'), line(9.5, 9.5, 6.5, 12.5, 'c'), line(12, 13.5, 16, 13.5, 'd')),
         spark: (sz = 12) => svg(sz, '0 0 24 24', path('M12 2l2.2 5.8L20 10l-5.8 2.2L12 18l-2.2-5.8L4 10l5.8-2.2z', 'a')),
+        // v1.9.17：复制（两张叠放的纸）——设置页日志卡「复制日志」用
+        copy: (sz = 12) => svg(sz, '0 0 24 24', rect(8, 8, 12, 13, 1.5, 'a'), path('M16 8V5.5A1.5 1.5 0 0 0 14.5 4h-9A1.5 1.5 0 0 0 4 5.5v11A1.5 1.5 0 0 0 5.5 18H8', 'b')),
       };
     })();
 

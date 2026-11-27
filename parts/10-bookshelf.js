@@ -97,8 +97,16 @@ W.CSS_10 = `
     const [tab, setTab] = useState(initialTab === 'cookie' || initialTab === 'protocol' ? initialTab : 'apikey');
 
     // v1.2.5：打开弹层即自动核验各通道（服务端 verifyNow），「未复核」状态秒级消解为 有效/已过期
+    // v1.9.14（延迟源 A）：原实现只在挂载时取一次 verify 快照、此后永不更新——阅读窗口扫码登录的
+    // 会话回流/采纳若在该快照之后才落账，弹窗芯片会一直停在灰/过期（父级 1s 轮询已把 loggedIn
+    // 刷新，但弹窗通道状态不跟随）。现两路保活：① 父级 state 变化即同步最新通道态；② 未登录时
+    // 短周期重核（追上后台采纳），已登录即停（verifyNow 是实时服务端请求，登录态下无谓打接口）。
     const [liveChannels, setLiveChannels] = useState(channels);
+    const [verifyTick, setVerifyTick] = useState(0);
     const [verifying, setVerifying] = useState(false); // effect 里置 true（rmsmoke no-op effect 下直接用传入状态）
+    useEffect(() => { // ① 父级 state（1s 轮询）带来更新的通道态 → 采纳落账后即时反映
+      if (channels) setLiveChannels((prev) => (prev === channels ? prev : channels));
+    }, [channels]);
     useEffect(() => {
       let cancelled = false;
       setVerifying(true);
@@ -107,7 +115,9 @@ W.CSS_10 = `
         .catch(() => { /* 核验失败保持传入状态 */ })
         .finally(() => { if (!cancelled) setVerifying(false); });
       return () => { cancelled = true; };
-    }, []);
+    }, [verifyTick]);
+    // ② 未登录时每 3s 重核一次（后台采纳落账 → 服务端返回有效 → 芯片转绿；loggedIn 翻真即停）
+    W.usePoll(async () => { setVerifyTick((k) => k + 1); }, 3000, loggedIn !== true);
 
     const ch = liveChannels || {};
     const apiKeyState = verifying ? 'verifying'
@@ -126,11 +136,28 @@ W.CSS_10 = `
     // v1.2.6：hover 详情行（固定高度防跳动；默认显示图例）
     const [hoverHint, setHoverHint] = useState('');
 
+    // v1.9.14（任务：已登录不显示二维码/Cookie 输入）：已登录时扫码与 Cookie 两个通道收起，
+    // 默认只留「API Key 绑定到当前账号」（推荐操作）；换号/新增账号经折叠入口显式展开。
+    // - 扫码/Cookie 是「建立登录态」的入口，已登录态下展示会诱导重复登录；
+    // - 折叠入口默认收起但保留——多账号/切号场景不被堵死；
+    // - 已登录态下若正停在扫码/Cookie tab（如登录态在弹窗开着时自动同步点亮）→ 拉回 API Key。
+    const [showSwitch, setShowSwitch] = useState(false);
+    const isLoggedIn = loggedIn === true;
+    useEffect(() => {
+      if (isLoggedIn && !showSwitch && (tab === 'protocol' || tab === 'cookie')) setTab('apikey');
+    }, [isLoggedIn, showSwitch, tab]);
+    const hideLoginInputs = isLoggedIn && !showSwitch;
+    const effTab = hideLoginInputs ? 'apikey' : tab;
+
     return h('div', { className: 'wr-modal-mask', onClick: onClose },
       h('div', { className: 'wr-modal', onClick: (e) => e.stopPropagation() },
         // v1.8.7：多账号语义提示——让用户知道「再登录是新增账号还是替换账号」（多账号开关此前为假开关）
         h('div', { className: 'wr-muted wr-small', style: { marginBottom: 8 } },
           W.t.loginAccountHint(accountName, multiAccount !== false)),
+        // v1.9.14：已登录高亮提示条——明确告知「已登录、无需重复登录」，替代原二维码/Cookie 表单
+        isLoggedIn && h('div', { className: 'wr-ok', style: { marginBottom: '10px', padding: '8px 10px', background: 'rgba(63,185,80,.08)', borderRadius: '6px' } },
+          h('div', { style: { fontWeight: 600 } }, '✓ ' + W.t.alreadyLoggedIn),
+          h('div', { className: 'wr-muted', style: { marginTop: '2px' } }, W.t.alreadyLoggedInHint)),
         h('div', { className: 'wr-modal-title' }, W.t.login,
           // v1.3.1：图例移标题右侧，圆点带对应颜色渲染
           h('span', { className: 'wr-muted', style: { marginLeft: 'auto', marginRight: '10px', fontSize: '11px', fontWeight: 400, display: 'inline-flex', alignItems: 'center', gap: '8px' } },
@@ -145,17 +172,23 @@ W.CSS_10 = `
               W.t.legendAbsent)),
           h('button', { className: 'wr-close', onClick: onClose }, '×')),
         // v1.2.3 状态条（兼 tab）/ v1.2.5 状态点移名称尾部 / v1.2.6 hover 详情行
+        // v1.9.14：已登录且未展开换号 → 扫码/Cookie 芯片不渲染（只留 API Key）
         h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '6px', marginBottom: '6px' } },
-          h(LoginChannelChip, { active: tab === 'apikey', onClick: () => setTab('apikey'), state: apiKeyState === 'verifying' ? 'absent' : apiKeyState, label: W.t.loginApiKey, tip: apiKeyText + checkedSuffix, onHover: setHoverHint }),
-          h(LoginChannelChip, { active: tab === 'protocol', onClick: () => setTab('protocol'), state: cookieState === 'unknown' || cookieState === 'verifying' ? 'absent' : cookieState, label: W.t.loginProtocol, tip: cookieText + ' · ' + W.t.channelCookieSharedTip, onHover: setHoverHint }),
-          h(LoginChannelChip, { active: tab === 'cookie', onClick: () => setTab('cookie'), state: cookieState === 'unknown' || cookieState === 'verifying' ? 'absent' : cookieState, label: W.t.loginCookie, tip: cookieText + ' · ' + W.t.channelCookieSharedTip, onHover: setHoverHint })),
+          h(LoginChannelChip, { active: effTab === 'apikey', onClick: () => setTab('apikey'), state: apiKeyState === 'verifying' ? 'absent' : apiKeyState, label: W.t.loginApiKey, tip: apiKeyText + checkedSuffix, onHover: setHoverHint }),
+          !hideLoginInputs && h(LoginChannelChip, { active: effTab === 'protocol', onClick: () => setTab('protocol'), state: cookieState === 'unknown' || cookieState === 'verifying' ? 'absent' : cookieState, label: W.t.loginProtocol, tip: cookieText + ' · ' + W.t.channelCookieSharedTip, onHover: setHoverHint }),
+          !hideLoginInputs && h(LoginChannelChip, { active: effTab === 'cookie', onClick: () => setTab('cookie'), state: cookieState === 'unknown' || cookieState === 'verifying' ? 'absent' : cookieState, label: W.t.loginCookie, tip: cookieText + ' · ' + W.t.channelCookieSharedTip, onHover: setHoverHint })),
         h('div', { className: 'wr-muted wr-small', style: { minHeight: '18px', marginBottom: '10px', lineHeight: '18px' } },
           hoverHint || W.t.channelLegendHint),
-        tab === 'apikey'
+        effTab === 'apikey'
           ? h(ApiKeyLogin, { onDone, loggedIn, gateway })
-          : tab === 'protocol'
+          : effTab === 'protocol'
             ? h(ProtocolLogin, { onDone })
-            : h(CookieLogin, { onDone })));
+            : h(CookieLogin, { onDone }),
+        // v1.9.14：已登录时的换号入口（默认收起）——展开后才渲染扫码/Cookie 芯片与表单
+        isLoggedIn && h('div', { style: { marginTop: '12px', borderTop: '1px solid var(--dsw-alias-border, rgba(128,128,128,.25))', paddingTop: '8px' } },
+          h('button', { className: 'wr-mini', style: { textDecoration: 'underline' }, onClick: () => setShowSwitch((v) => !v) },
+            (showSwitch ? '▾ ' : '▸ ') + W.t.loginSwitchAccount),
+          showSwitch && h('div', { className: 'wr-muted wr-small', style: { marginTop: '4px' } }, W.t.loginSwitchAccountHint))));
   };
 
   // v1.1：API Key 官方通道登录（已登录=绑定当前账号；未登录=独立账号）
